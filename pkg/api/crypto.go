@@ -17,258 +17,316 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 
-	"github.com/pdfcpu/pdfcpu/pkg/log"
+	"github.com/pdfcpu/pdfcpu/internal/contextutil"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
-	"github.com/pkg/errors"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/fault"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-// Encrypt reads a PDF stream from rs and writes the encrypted PDF stream to w.
+// Encrypt reads a PDF stream from rs, writes the encrypted PDF stream to w and supports cancellation.
 // A configuration containing at least the current passwords is required.
-func Encrypt(rs io.ReadSeeker, w io.Writer, conf *pdfcpu.Configuration) error {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for encryption")
-	}
-	conf.Cmd = pdfcpu.ENCRYPT
+func Encrypt(c context.Context, rs io.ReadSeeker, w io.Writer, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
 
-	return Optimize(rs, w, conf)
-}
-
-// EncryptFile encrypts inFile and writes the result to outFile.
-// A configuration containing at least the current passwords is required.
-func EncryptFile(inFile, outFile string, conf *pdfcpu.Configuration) (err error) {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for encryption")
-	}
-	conf.Cmd = pdfcpu.ENCRYPT
-
-	var f1, f2 *os.File
-
-	if f1, err = os.Open(inFile); err != nil {
+	if err := contextutil.Check(c); err != nil {
 		return err
 	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
 
-	tmpFile := inFile + ".tmp"
+	if w == nil {
+		return ErrMissingPDFWriter
+	}
+
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	conf = operationConfiguration(conf, model.ENCRYPT)
+
+	if err := optimize(c, rs, w, conf, ProgressOptions{}); err != nil {
+		return fmt.Errorf("encrypt: %w", err)
+	}
+	return nil
+}
+
+// EncryptFile encrypts inFile, writes the result to outFile and supports cancellation.
+// A configuration containing at least the current passwords is required.
+func EncryptFile(c context.Context, inFile, outFile string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+	f1, err := os.Open(inFile)
+	if err != nil {
+		return fmt.Errorf("encrypt: open input %s: %w", inFile, err)
+	}
+	tmpFile := ""
 	if outFile != "" && inFile != outFile {
 		tmpFile = outFile
-		log.CLI.Printf("writing %s...\n", outFile)
-	} else {
-		log.CLI.Printf("writing %s...\n", inFile)
 	}
-
-	if f2, err = os.Create(tmpFile); err != nil {
-		return err
+	staged, err := openStagedOutput(f1, inFile, tmpFile, "encrypt")
+	if err != nil {
+		return errors.Join(fmt.Errorf("encrypt: create output: %w", err), closeFile(f1, "encrypt: close input"))
 	}
-
+	ok := false
 	defer func() {
-		if err != nil {
-			f2.Close()
-			f1.Close()
-			os.Remove(tmpFile)
+		if !ok {
+			err = staged.cleanup(err)
 			return
 		}
-		if err = f2.Close(); err != nil {
-			return
-		}
-		if err = f1.Close(); err != nil {
-			return
-		}
-		if outFile == "" || inFile == outFile {
-			if err = os.Rename(tmpFile, inFile); err != nil {
-				return
-			}
-		}
+		err = staged.commit()
 	}()
 
-	return Encrypt(f1, f2, conf)
-}
-
-// Decrypt reads a PDF stream from rs and writes the encrypted PDF stream to w.
-// A configuration containing at least the current passwords is required.
-func Decrypt(rs io.ReadSeeker, w io.Writer, conf *pdfcpu.Configuration) error {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for decryption")
-	}
-	conf.Cmd = pdfcpu.DECRYPT
-
-	return Optimize(rs, w, conf)
-}
-
-// DecryptFile decrypts inFile and writes the result to outFile.
-// A configuration containing at least the current passwords is required.
-func DecryptFile(inFile, outFile string, conf *pdfcpu.Configuration) (err error) {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for decryption")
-	}
-	conf.Cmd = pdfcpu.DECRYPT
-
-	var f1, f2 *os.File
-
-	if f1, err = os.Open(inFile); err != nil {
+	if err = Encrypt(c, f1, staged.output.file, conf); err != nil {
 		return err
 	}
+	if err = contextutil.Check(c); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
 
-	tmpFile := inFile + ".tmp"
+// Decrypt reads an encrypted PDF stream from rs, writes the decrypted PDF stream to w and supports cancellation.
+// A configuration containing at least the current passwords is required.
+func Decrypt(c context.Context, rs io.ReadSeeker, w io.Writer, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+
+	if w == nil {
+		return ErrMissingPDFWriter
+	}
+
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	conf = operationConfiguration(conf, model.DECRYPT)
+
+	if err := optimize(c, rs, w, conf, ProgressOptions{}); err != nil {
+		return fmt.Errorf("decrypt: %w", err)
+	}
+	return nil
+}
+
+// DecryptFile decrypts inFile, writes the result to outFile and supports cancellation.
+// A configuration containing at least the current passwords is required.
+func DecryptFile(c context.Context, inFile, outFile string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+	f1, err := os.Open(inFile)
+	if err != nil {
+		return fmt.Errorf("decrypt: open input %s: %w", inFile, err)
+	}
+	tmpFile := ""
 	if outFile != "" && inFile != outFile {
 		tmpFile = outFile
-		log.CLI.Printf("writing %s...\n", outFile)
-	} else {
-		log.CLI.Printf("writing %s...\n", inFile)
 	}
-
-	if f2, err = os.Create(tmpFile); err != nil {
-		return err
+	staged, err := openStagedOutput(f1, inFile, tmpFile, "decrypt")
+	if err != nil {
+		return errors.Join(fmt.Errorf("decrypt: create output: %w", err), closeFile(f1, "decrypt: close input"))
 	}
-
+	ok := false
 	defer func() {
-		if err != nil {
-			f2.Close()
-			f1.Close()
-			os.Remove(tmpFile)
+		if !ok {
+			err = staged.cleanup(err)
 			return
 		}
-		if err = f2.Close(); err != nil {
-			return
-		}
-		if err = f1.Close(); err != nil {
-			return
-		}
-		if outFile == "" || inFile == outFile {
-			if err = os.Rename(tmpFile, inFile); err != nil {
-				return
-			}
-		}
+		err = staged.commit()
 	}()
 
-	return Decrypt(f1, f2, conf)
+	if err = Decrypt(c, f1, staged.output.file, conf); err != nil {
+		return err
+	}
+	if err = contextutil.Check(c); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
-// ChangeUserPassword reads a PDF stream from rs, changes the user password and writes the encrypted PDF stream to w.
+// ChangeUserPassword reads a PDF stream from rs, changes the user password,
+// writes the encrypted PDF stream to w and supports cancellation.
 // A configuration containing the current passwords is required.
-func ChangeUserPassword(rs io.ReadSeeker, w io.Writer, pwOld, pwNew string, conf *pdfcpu.Configuration) error {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for change user password")
+func ChangeUserPassword(c context.Context, rs io.ReadSeeker, w io.Writer, pwOld, pwNew string, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
 	}
-	conf.Cmd = pdfcpu.CHANGEUPW
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+
+	if w == nil {
+		return ErrMissingPDFWriter
+	}
+
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+
+	conf = operationConfiguration(conf, model.CHANGEUPW)
 	conf.UserPW = pwOld
 	conf.UserPWNew = &pwNew
 
-	return Optimize(rs, w, conf)
+	if err := optimize(c, rs, w, conf, ProgressOptions{}); err != nil {
+		return fmt.Errorf("change user password: %w", err)
+	}
+	return nil
 }
 
-// ChangeUserPasswordFile reads inFile, changes the user password and writes the result to outFile.
+// ChangeUserPasswordFile reads inFile, changes the user password,
+// writes the result to outFile and supports cancellation.
 // A configuration containing the current passwords is required.
-func ChangeUserPasswordFile(inFile, outFile string, pwOld, pwNew string, conf *pdfcpu.Configuration) (err error) {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for change user password")
-	}
-	conf.Cmd = pdfcpu.CHANGEUPW
-	conf.UserPW = pwOld
-	conf.UserPWNew = &pwNew
+func ChangeUserPasswordFile(c context.Context, inFile, outFile string, pwOld, pwNew string, conf *model.Configuration) (err error) {
+	const op = "change user password"
 
-	var f1, f2 *os.File
-
-	if f1, err = os.Open(inFile); err != nil {
+	if err := contextutil.Check(c); err != nil {
 		return err
 	}
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
 
-	tmpFile := inFile + ".tmp"
+	f1, err := os.Open(inFile)
+	if err != nil {
+		return fmt.Errorf("%s: open input %s: %w", op, inFile, err)
+	}
+	tmpFile := ""
 	if outFile != "" && inFile != outFile {
 		tmpFile = outFile
-		log.CLI.Printf("writing %s...\n", outFile)
-	} else {
-		log.CLI.Printf("writing %s...\n", inFile)
 	}
-
-	if f2, err = os.Create(tmpFile); err != nil {
-		return err
+	staged, err := openStagedOutput(f1, inFile, tmpFile, op)
+	if err != nil {
+		return errors.Join(fmt.Errorf("%s: create output: %w", op, err), closeFile(f1, op+": close input"))
 	}
-
+	ok := false
 	defer func() {
-		if err != nil {
-			f2.Close()
-			f1.Close()
-			os.Remove(tmpFile)
+		if !ok {
+			err = staged.cleanup(err)
 			return
 		}
-		if err = f2.Close(); err != nil {
-			return
-		}
-		if err = f1.Close(); err != nil {
-			return
-		}
-		if outFile == "" || inFile == outFile {
-			if err = os.Rename(tmpFile, inFile); err != nil {
-				return
-			}
-		}
+		err = staged.commit()
 	}()
 
-	return ChangeUserPassword(f1, f2, pwOld, pwNew, conf)
+	if err = ChangeUserPassword(c, f1, staged.output.file, pwOld, pwNew, conf); err != nil {
+		return err
+	}
+	if err = contextutil.Check(c); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
-// ChangeOwnerPassword reads a PDF stream from rs, changes the owner password and writes the encrypted PDF stream to w.
+// ChangeOwnerPassword reads a PDF stream from rs, changes the owner password,
+// writes the encrypted PDF stream to w and supports cancellation.
 // A configuration containing the current passwords is required.
-func ChangeOwnerPassword(rs io.ReadSeeker, w io.Writer, pwOld, pwNew string, conf *pdfcpu.Configuration) error {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for change owner password")
+func ChangeOwnerPassword(c context.Context, rs io.ReadSeeker, w io.Writer, pwOld, pwNew string, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
 	}
-	conf.Cmd = pdfcpu.CHANGEOPW
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+
+	if w == nil {
+		return ErrMissingPDFWriter
+	}
+
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	if pwNew == "" {
+		return fmt.Errorf("change owner password: new owner password must not be empty: %w", pdfcpu.ErrOwnerPasswordRequired)
+	}
+
+	conf = operationConfiguration(conf, model.CHANGEOPW)
 	conf.OwnerPW = pwOld
 	conf.OwnerPWNew = &pwNew
 
-	return Optimize(rs, w, conf)
+	if err := optimize(c, rs, w, conf, ProgressOptions{}); err != nil {
+		return fmt.Errorf("change owner password: %w", err)
+	}
+	return nil
 }
 
-// ChangeOwnerPasswordFile reads inFile, changes the owner password and writes the result to outFile.
+// ChangeOwnerPasswordFile reads inFile, changes the owner password,
+// writes the result to outFile and supports cancellation.
 // A configuration containing the current passwords is required.
-func ChangeOwnerPasswordFile(inFile, outFile string, pwOld, pwNew string, conf *pdfcpu.Configuration) (err error) {
-	if conf == nil {
-		return errors.New("pdfcpu: missing configuration for change owner password")
-	}
-	conf.Cmd = pdfcpu.CHANGEOPW
-	conf.OwnerPW = pwOld
-	conf.OwnerPWNew = &pwNew
+func ChangeOwnerPasswordFile(c context.Context, inFile, outFile string, pwOld, pwNew string, conf *model.Configuration) (err error) {
+	const op = "change owner password"
 
-	var f1, f2 *os.File
-
-	if f1, err = os.Open(inFile); err != nil {
+	if err := contextutil.Check(c); err != nil {
 		return err
 	}
+	if conf == nil {
+		return ErrMissingConfiguration
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+	if pwNew == "" {
+		return fmt.Errorf("%s: new owner password must not be empty: %w", op, pdfcpu.ErrOwnerPasswordRequired)
+	}
 
-	tmpFile := inFile + ".tmp"
+	f1, err := os.Open(inFile)
+	if err != nil {
+		return fmt.Errorf("%s: open input %s: %w", op, inFile, err)
+	}
+	tmpFile := ""
 	if outFile != "" && inFile != outFile {
 		tmpFile = outFile
-		log.CLI.Printf("writing %s...\n", outFile)
-	} else {
-		log.CLI.Printf("writing %s...\n", inFile)
 	}
-
-	if f2, err = os.Create(tmpFile); err != nil {
-		return err
+	staged, err := openStagedOutput(f1, inFile, tmpFile, op)
+	if err != nil {
+		return errors.Join(fmt.Errorf("%s: create output: %w", op, err), closeFile(f1, op+": close input"))
 	}
-
+	ok := false
 	defer func() {
-		if err != nil {
-			f2.Close()
-			f1.Close()
-			os.Remove(tmpFile)
+		if !ok {
+			err = staged.cleanup(err)
 			return
 		}
-		if err = f2.Close(); err != nil {
-			return
-		}
-		if err = f1.Close(); err != nil {
-			return
-		}
-		if outFile == "" || inFile == outFile {
-			if err = os.Rename(tmpFile, inFile); err != nil {
-				return
-			}
-		}
+		err = staged.commit()
 	}()
 
-	return ChangeOwnerPassword(f1, f2, pwOld, pwNew, conf)
+	if err = ChangeOwnerPassword(c, f1, staged.output.file, pwOld, pwNew, conf); err != nil {
+		return err
+	}
+	if err = contextutil.Check(c); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }

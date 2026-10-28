@@ -23,6 +23,7 @@ import (
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 func testAddWatermarks(t *testing.T, msg, inFile, outFile string, selectedPages []string, mode, modeParam, desc string, onTop bool) {
@@ -32,25 +33,26 @@ func testAddWatermarks(t *testing.T, msg, inFile, outFile string, selectedPages 
 	if onTop {
 		s = "stamp"
 	}
-	outFile = filepath.Join("..", "..", "samples", s, mode, outFile)
+	outFile = filepath.Join(samplesDir, s, mode, outFile)
 
 	var err error
 	switch mode {
 	case "text":
-		err = api.AddTextWatermarksFile(inFile, outFile, selectedPages, onTop, modeParam, desc, nil)
+		err = api.AddTextWatermarksFile(t.Context(), inFile, outFile, selectedPages, onTop, modeParam, desc, nil)
 	case "image":
-		err = api.AddImageWatermarksFile(inFile, outFile, selectedPages, onTop, modeParam, desc, nil)
+		err = api.AddImageWatermarksFile(t.Context(), inFile, outFile, selectedPages, onTop, modeParam, desc, nil)
 	case "pdf":
-		err = api.AddPDFWatermarksFile(inFile, outFile, selectedPages, onTop, modeParam, desc, nil)
+		err = api.AddPDFWatermarksFile(t.Context(), inFile, outFile, selectedPages, onTop, modeParam, desc, nil)
 	}
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	if err := api.ValidateFile(outFile, nil); err != nil {
+	if err := api.ValidateFile(t.Context(), outFile, nil, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
+// TestAddWatermarks verifies add watermarks.
 func TestAddWatermarks(t *testing.T) {
 	for _, tt := range []struct {
 		msg             string
@@ -60,6 +62,28 @@ func TestAddWatermarks(t *testing.T) {
 		modeParm        string
 		wmConf          string
 	}{
+
+		// Avoid font embedding for CJK fonts like so:
+
+		// Any font name ending with GB2312 will be recognized as using HANS:
+
+		// {"TestWatermarkText",
+		// 	"sample.pdf",
+		// 	"chinese.pdf",
+		// 	[]string{"1-"},
+		// 	"text",
+		// 	"测试中文字体水印增加的文件大小\n2023-10-16",
+		// 	"font: KaiTi_GB2312, points: 36, scale: 1 abs, color: #ff0000, op: 0.3, ro: 30"},
+
+		// Configure script manually:
+
+		// {"TestWatermarkText",
+		// 	"sample.pdf",
+		// 	"chinese1.pdf",
+		// 	[]string{"1-"},
+		// 	"text",
+		// 	"测试中文字体水印增加的文件大小\n2023-10-16",
+		// 	"font: KaiTi_GB2312, script: hans,  points: 36, scale: 1 abs, color: #ff0000, op: 0.3, ro: 30"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -79,20 +103,28 @@ func TestAddWatermarks(t *testing.T) {
 			[]string{"1-"},
 			"text",
 			`A simple text watermark using defaults:
-			Unique abbreviations also work:
-			"fo:Helvetica, poi:24, align:c,
-			pos:c, off:0 0, sc:0.5 rel, d:1,
-			op:1, mode:0, fillc: 0.5 0.5 0.5,
-			strokec: #808080"`,
+					Unique abbreviations also work:
+					"fo:Helvetica, poi:24, align:c,
+					pos:c, off:0 0, scale:0.5 rel, d:1,
+					op:1, mode:0, fillc: 0.5 0.5 0.5,
+					strokec: #808080"`,
 			""},
+
+		{"TestWatermarkText",
+			"Walden.pdf",
+			"TextAlongLeftBorder.pdf",
+			[]string{"1-"},
+			"text",
+			"Welcome to pdfcpu",
+			"pos:l, off:0 0, rot:-90"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
 			"TextPagenumbers.pdf",
 			[]string{"1-"},
 			"text",
-			"Page %p of %P",
-			"sc:1 abs, pos:bc, rot:0"},
+			"Page %p of %P", // or "%p10 of %P" if you want to consider a page offset of 10.
+			"scale:1 abs, pos:bc, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -101,8 +133,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Rendermode 0 fills text using fill color.\n" +
 				"\"rendermode\" or \"mode\" works - also abbreviated: \n" +
-				"\"mode:0, fillc:#3277d3, rot:0, sc:.8\"",
-			"mode:0, fillc:#3277d3, rot:0, sc:.8"},
+				"\"mode:0, fillc:#3277d3, rot:0, scale:.8\"",
+			"mode:0, fillc:#3277d3, rot:0, scale:.8"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -111,8 +143,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Rendermode 1 strokes text using stroke color.\n" +
 				"\"rendermode\" or \"mode\" works - also abbreviated: \n" +
-				"\"mo:1, strokec:#335522, rot:0, sc:.8\"",
-			"mo:1, strokec:#335522, rot:0, sc:.8"},
+				"\"mo:1, strokec:#335522, rot:0, scale:.8\"",
+			"mo:1, strokec:#335522, rot:0, scale:.8"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -122,8 +154,8 @@ func TestAddWatermarks(t *testing.T) {
 			"Rendermode 2 strokes text using stroke color\n" +
 				"and fills text using fill color\n" +
 				"\"rendermode\" or \"mode\" works - also abbreviated: \n" +
-				"\"re:2, fillc:#3277d3, strokec:#335522, rot:0, sc:.8\"",
-			"re:2, fillc:#3277d3, strokec:#335522, rot:0, sc:.8"},
+				"\"re:2, fillc:#3277d3, strokec:#335522, rot:0, scale:.8\"",
+			"re:2, fillc:#3277d3, strokec:#335522, rot:0, scale:.8"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -175,8 +207,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Relative scale factor: .25\n" +
 				"scales relative to page dimensions.\n" +
-				"\"sc:.25 rel, fillc:#3277d3, rot:0\"",
-			"sc:.25 rel, fillc:#3277d3, rot:0"},
+				"\"scale:.25 rel, fillc:#3277d3, rot:0\"",
+			"scale:.25 rel, fillc:#3277d3, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -185,8 +217,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Relative scale factor: .5\n" +
 				"scales relative to page dimensions.\n" +
-				"\"sc:.5, fillc:#3277d3, rot:0\"",
-			"sc:.5, fillc:#3277d3, rot:0"},
+				"\"scale:.5, fillc:#3277d3, rot:0\"",
+			"scale:.5, fillc:#3277d3, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -195,8 +227,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Relative scale factor: 1\n" +
 				"scales relative to page dimensions.\n" +
-				"\"sc:1, fillc:#3277d3, rot:0\"",
-			"sc:1, fillc:#3277d3, rot:0"},
+				"\"scale:1, fillc:#3277d3, rot:0\"",
+			"scale:1, fillc:#3277d3, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -206,8 +238,8 @@ func TestAddWatermarks(t *testing.T) {
 			"Absolute scale factor: .5\n" +
 				"scales fontsize\n" +
 				"(here using the 24 points default)\n" +
-				"\"sc:.5 abs, font:Courier, rot:0\"",
-			"sc:.5 abs, font:Courier, rot:0"},
+				"\"scale:.5 abs, font:Courier, rot:0\"",
+			"scale:.5 abs, font:Courier, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -217,8 +249,8 @@ func TestAddWatermarks(t *testing.T) {
 			"Absolute scale factor: 1\n" +
 				"scales fontsize\n" +
 				"(here using the 24 points default)\n" +
-				"\"sc:1 abs, font:Courier, rot:0\"",
-			"sc:1 abs, font:Courier, rot:0"},
+				"\"scale:1 abs, font:Courier, rot:0\"",
+			"scale:1 abs, font:Courier, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -228,8 +260,8 @@ func TestAddWatermarks(t *testing.T) {
 			"Absolute scale factor: 1.5\n" +
 				"scales fontsize\n" +
 				"(here using the 24 points default)\n" +
-				"\"sc:1.5 abs, font:Courier, rot:0\"",
-			"sc:1.5 abs, font:Courier, rot:0"},
+				"\"scale:1.5 abs, font:Courier, rot:0\"",
+			"scale:1.5 abs, font:Courier, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -256,8 +288,8 @@ func TestAddWatermarks(t *testing.T) {
 			"TextOffAndRot.pdf",
 			[]string{"1-"},
 			"text",
-			"Confidential\n\"sc:1 abs, points:20, pos:c, off:0 50, fillc:#000000, rot:20\"",
-			"sc:1 abs, points:20, pos:c, off:0 50, fillc:#000000, rot:20"},
+			"Confidential\n\"scale:1 abs, points:20, pos:c, off:0 50, fillc:#000000, rot:20\"",
+			"scale:1 abs, points:20, pos:c, off:0 50, fillc:#000000, rot:20"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -276,8 +308,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Set top/bottom and left/right margins:\n" +
 				"(needs \"bgcol\")\n" +
-				"\"ma: 5 10, fillc:#3277d3, bgcol:#beded9, rot:0\"",
-			"ma: 5 10, fillc:#3277d3, bgcol:#beded9, rot:0"},
+				"\"marg: 5 10, fillc:#3277d3, bgcol:#beded9, rot:0\"",
+			"marg: 5 10, fillc:#3277d3, bgcol:#beded9, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -286,8 +318,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Set top, left/right and  bottom margins:\n" +
 				"(needs \"bgcol\")\n" +
-				"\"ma: 5 10 15, fillc:#3277d3, bgcol:#beded9, rot:0\"",
-			"ma: 5 10 15, fillc:#3277d3, bgcol:#beded9, rot:0"},
+				"\"marg: 5 10 15, fillc:#3277d3, bgcol:#beded9, rot:0\"",
+			"marg: 5 10 15, fillc:#3277d3, bgcol:#beded9, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -296,8 +328,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Set all margins individually:\n" +
 				"(needs \"bgcol\")\n" +
-				"\"ma: 5 10 15 20, fillc:#3277d3, bgcol:#beded9, rot:0\"",
-			"ma: 5 10 15 20, fillc:#3277d3, bgcol:#beded9, rot:0"},
+				"\"marg: 5 10 15 20, fillc:#3277d3, bgcol:#beded9, rot:0\"",
+			"marg: 5 10 15 20, fillc:#3277d3, bgcol:#beded9, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -339,8 +371,8 @@ func TestAddWatermarks(t *testing.T) {
 			"text",
 			"Set margins and colored border:\n" +
 				"(needs \"bgcol\")\n" +
-				"\"ma: 10, bo: 5 .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0\"",
-			"ma: 10, bo: 5 .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0"},
+				"\"marg: 10, bo: 5 .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0\"",
+			"marg: 10, bo: 5 .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0"},
 
 		{"TestWatermarkText",
 			"Walden.pdf",
@@ -350,8 +382,8 @@ func TestAddWatermarks(t *testing.T) {
 			"Set margins and round colored border:\n" +
 				"(needs \"bgcol\")\n" +
 				"round corner effect depends on border width\n" +
-				"\"ma: 5, bo: 7 round .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0\"",
-			"ma: 5, bo: 7 round .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0"},
+				"\"marg: 5, bo: 7 round .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0\"",
+			"marg: 5, bo: 7 round .3 .7 .7, fillc:#3277d3, bgcol:#beded9, rot:0"},
 
 		// Add image watermark to inFile starting at page 1 using no rotation.
 		{"TestWatermarkImage",
@@ -360,7 +392,7 @@ func TestAddWatermarks(t *testing.T) {
 			[]string{"1-"},
 			"image",
 			filepath.Join(resDir, "logoSmall.png"),
-			"sc:.25, rot:90"},
+			"scale:.25, rot:90"},
 
 		// Add image watermark to inFile for all pages using defaults..
 		{"TestWatermarkImage2",
@@ -369,7 +401,7 @@ func TestAddWatermarks(t *testing.T) {
 			nil,
 			"image",
 			filepath.Join(resDir, "logoSmall.png"),
-			"sc:.1, pos:bl, off:15 20, rot:0"},
+			"scale:.1, pos:bl, off:15 20, rot:0"},
 
 		// Add image stamp to inFile using absolute scaling and a rotation of 45 degrees.
 		{"TestStampImageAbsScaling",
@@ -384,27 +416,60 @@ func TestAddWatermarks(t *testing.T) {
 		// and rotate along the 2nd diagonal running from upper left to lower right corner.
 		{"TestWatermarkPDF",
 			"Walden.pdf",
-			"PdfDiagonale2Single.pdf",
+			"PdfSingleStampDefault.pdf",
 			nil,
 			"pdf",
 			filepath.Join(inDir, "Walden.pdf:1"),
 			"d:2"},
 
-		// Add a PDF multistamp to all pages of inFile
-		// and rotate along the 2nd diagonal running from upper left to lower right corner.
+		// Add a PDF multistamp in the top right corner to all pages of inFile.
 		{"TestWatermarkPDF",
 			"Walden.pdf",
-			"PdfDefaultsMulti.pdf",
+			"PdfMultistampDefault.pdf",
 			nil,
 			"pdf",
 			filepath.Join(inDir, "Walden.pdf"),
-			"sc:.2, pos:tr, off:-10 -10, rot:0"},
+			"scale:.2, pos:tr, off:-10 -10, rot:0"},
+
+		// Add a PDF multistamp to all pages of inFile.
+		// Start by stamping page 3 with page 1.
+		// You may filter stamping by defining selected Pages.
+		{"TestWatermarkPDF",
+			"zineTest.pdf",
+			"PdfMultistamp13.pdf",
+			nil,
+			"pdf",
+			filepath.Join(inDir, "zineTest.pdf:1:3"),
+			"scale:.2, pos:tr, off:-10 -10, rot:0"},
+
+		// Add a PDF multistamp to all pages of inFile.
+		// Start by stamping page 1 with page 3.
+		// You may filter stamping by defining selected Pages.
+		{"TestWatermarkPDF",
+			"zineTest.pdf",
+			"PdfMultistamp31.pdf",
+			nil,
+			"pdf",
+			filepath.Join(inDir, "zineTest.pdf:3:1"),
+			"scale:.2, pos:tr, off:-10 -10, rot:0"},
+
+		// Add a PDF multistamp to all pages of inFile.
+		// Start by stamping page 3 with page 3.
+		// You may filter stamping by defining selected Pages.
+		{"TestWatermarkPDF",
+			"zineTest.pdf",
+			"PdfMultistamp33.pdf",
+			nil,
+			"pdf",
+			filepath.Join(inDir, "zineTest.pdf:3:3"),
+			"scale:.2, pos:tr, off:-10 -10, rot:0"},
 	} {
 		testAddWatermarks(t, tt.msg, tt.inFile, tt.outFile, tt.selectedPages, tt.mode, tt.modeParm, tt.wmConf, false)
 		testAddWatermarks(t, tt.msg, tt.inFile, tt.outFile, tt.selectedPages, tt.mode, tt.modeParm, tt.wmConf, true)
 	}
 }
 
+// TestAddStampWithLink verifies add stamp with link.
 func TestAddStampWithLink(t *testing.T) {
 	for _, tt := range []struct {
 		msg             string
@@ -436,49 +501,59 @@ func TestAddStampWithLink(t *testing.T) {
 
 }
 
+// TestCropBox verifies crop box.
 func TestCropBox(t *testing.T) {
 	msg := "TestCropBox"
 	inFile := filepath.Join(inDir, "empty.pdf")
-	outFile := filepath.Join("..", "..", "samples", "stamp", "pdf", "PdfWithCropBox.pdf")
+	outFile := filepath.Join(samplesDir, "stamp", "pdf", "PdfWithCropBox.pdf")
 	pdfFile := filepath.Join(inDir, "grid_example.pdf")
 
 	// Create a context.
-	ctx, err := api.ReadContextFile(inFile)
+	ctx, err := api.ReadContextFile(t.Context(), inFile)
 	if err != nil {
 		t.Fatalf("%s readContext: %v\n", msg, err)
 	}
 
 	for _, pos := range []string{"tl", "tc", "tr", "l", "c", "r", "bl", "bc", "br"} {
-		wm, err := api.PDFWatermark(pdfFile+":1", fmt.Sprintf("sc:.25 rel, pos:%s, rot:0", pos), true, false, pdfcpu.POINTS)
+		wm, err := api.PDFWatermark(
+			t.Context(),
+			pdfFile+":1",
+			fmt.Sprintf("scale:.25 rel, pos:%s, rot:0", pos),
+			true,
+			false,
+			types.POINTS,
+			nil,
+		)
 		if err != nil {
 			t.Fatalf("%s %s: %v\n", msg, outFile, err)
 		}
-		if err := ctx.AddWatermarks(nil, wm); err != nil {
+		if err := pdfcpu.AddWatermarks(t.Context(), ctx, nil, wm); err != nil {
 			t.Fatalf("%s %s: %v\n", msg, outFile, err)
 		}
 	}
 
 	// Write context to file.
-	if err := api.WriteContextFile(ctx, outFile); err != nil {
+	if err := api.WriteContextFile(t.Context(), ctx, outFile); err != nil {
 		t.Fatalf("%s write: %v\n", msg, err)
 	}
 
-	if err := api.ValidateFile(outFile, nil); err != nil {
+	if err := api.ValidateFile(t.Context(), outFile, nil, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
 func hasWatermarks(inFile string, t *testing.T) bool {
 	t.Helper()
-	ok, err := api.HasWatermarksFile(inFile, nil)
+	ok, err := api.HasWatermarksFile(t.Context(), inFile, nil)
 	if err != nil {
 		t.Fatalf("Checking for watermarks: %s: %v\n", inFile, err)
 	}
 	return ok
 }
 
-func TestStampingLifecyle(t *testing.T) {
-	msg := "TestStampingLifecyle"
+// TestStampingLifecycle verifies stamping lifecycle.
+func TestStampingLifecycle(t *testing.T) {
+	msg := "TestStampingLifecycle"
 	inFile := filepath.Join(inDir, "Acroforms2.pdf")
 	outFile := filepath.Join(outDir, "stampLC.pdf")
 	onTop := true // we are testing stamps
@@ -488,14 +563,14 @@ func TestStampingLifecyle(t *testing.T) {
 		t.Fatalf("Watermarks found: %s\n", inFile)
 	}
 
-	unit := pdfcpu.POINTS
+	unit := types.POINTS
 
 	// Stamp all pages.
-	wm, err := api.TextWatermark("Demo", "", onTop, false, unit)
+	wm, err := api.TextWatermark(t.Context(), "Demo", "", onTop, false, unit, nil)
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	if err := api.AddWatermarksFile(inFile, outFile, nil, wm, nil); err != nil {
+	if err := api.AddWatermarksFile(t.Context(), inFile, outFile, nil, wm, nil); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
@@ -505,26 +580,26 @@ func TestStampingLifecyle(t *testing.T) {
 	}
 
 	// // Update stamp on page 1.
-	wm, err = api.TextWatermark("Confidential", "", onTop, true, unit)
+	wm, err = api.TextWatermark(t.Context(), "Confidential", "", onTop, true, unit, nil)
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	if err := api.AddWatermarksFile(outFile, "", []string{"1"}, wm, nil); err != nil {
+	if err := api.AddWatermarksFile(t.Context(), outFile, "", []string{"1"}, wm, nil); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Add another stamp on top for all pages.
 	// This is a redish transparent footer.
-	wm, err = api.TextWatermark("Footer", "pos:bc, c:0.8 0 0, op:.6, rot:0", onTop, false, unit)
+	wm, err = api.TextWatermark(t.Context(), "Footer", "pos:bc, c:0.8 0 0, op:.6, rot:0", onTop, false, unit, nil)
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	if err := api.AddWatermarksFile(outFile, "", nil, wm, nil); err != nil {
+	if err := api.AddWatermarksFile(t.Context(), outFile, "", nil, wm, nil); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Remove stamp on page 1.
-	if err := api.RemoveWatermarksFile(outFile, "", []string{"1"}, nil); err != nil {
+	if err := api.RemoveWatermarksFile(t.Context(), outFile, "", []string{"1"}, nil); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
@@ -534,17 +609,44 @@ func TestStampingLifecyle(t *testing.T) {
 	}
 
 	// Remove all stamps.
-	if err := api.RemoveWatermarksFile(outFile, "", nil, nil); err != nil {
+	if err := api.RemoveWatermarksFile(t.Context(), outFile, "", nil, nil); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Validate the result.
-	if err := api.ValidateFile(outFile, nil); err != nil {
+	if err := api.ValidateFile(t.Context(), outFile, nil, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 
 	// Check for existing stamps.
 	if ok := hasWatermarks(outFile, t); ok {
 		t.Fatalf("Watermarks found: %s\n", outFile)
+	}
+}
+
+// TestRecycleWM verifies recycle wm.
+func TestRecycleWM(t *testing.T) {
+	msg := "TestRecycleWM"
+	inFile := filepath.Join(inDir, "test.pdf")
+	outFile := filepath.Join(samplesDir, "watermark", "text", "TextRecycled.pdf")
+	onTop := false // we are testing watermarks
+
+	desc := "pos:tl, points:22, rot:0, scale:1 abs, off:0 -5, opacity:0.3"
+	wm, err := api.TextWatermark(t.Context(), "This is a watermark", desc, onTop, false, types.POINTS, nil)
+	if err != nil {
+		t.Fatalf("%s %s: %v\n", msg, outFile, err)
+	}
+
+	if err = api.AddWatermarksFile(t.Context(), inFile, outFile, nil, wm, nil); err != nil {
+		t.Fatalf("%s %s: %v\n", msg, outFile, err)
+	}
+
+	wm.Recycle()
+
+	// Shift down watermark.
+	wm.Dy = -55
+
+	if err = api.AddWatermarksFile(t.Context(), outFile, outFile, nil, wm, nil); err != nil {
+		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 }

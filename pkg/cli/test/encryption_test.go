@@ -17,16 +17,17 @@ limitations under the License.
 package test
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/pdfcpu/pdfcpu/pkg/cli"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-func confForAlgorithm(aes bool, keyLength int) *pdfcpu.Configuration {
-	c := pdfcpu.NewDefaultConfiguration()
+func confForAlgorithm(aes bool, keyLength int) *model.Configuration {
+	c := model.NewDefaultConfiguration()
 	c.EncryptUsingAES = aes
 	c.EncryptKeyLength = keyLength
 	return c
@@ -47,7 +48,7 @@ func testEncryptDecryptUseCase1(t *testing.T, fileName string, aes bool, keyLeng
 	conf.OwnerPW = "opw"
 
 	cmd := cli.EncryptCommand(inFile, outFile, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: encrypt to %s: %v\n", msg, outFile, err)
 	}
 
@@ -90,7 +91,7 @@ func testEncryptDecryptUseCase1(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld := "upw"
 	pwNew := ""
 	cmd = cli.ChangeUserPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s change userPW to \"\": %v\n", msg, outFile, err)
 	}
 
@@ -116,7 +117,7 @@ func testEncryptDecryptUseCase1(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld = "opw"
 	pwNew = "opwNew"
 	cmd = cli.ChangeOwnerPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s change opw: %v\n", msg, outFile, err)
 	}
 
@@ -125,7 +126,7 @@ func testEncryptDecryptUseCase1(t *testing.T, fileName string, aes bool, keyLeng
 	conf = confForAlgorithm(aes, keyLength)
 	conf.UserPW = "upwWrong"
 	cmd = cli.DecryptCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: %s decrypt using wrong upw should fail\n", msg, outFile)
 	}
 
@@ -134,21 +135,21 @@ func testEncryptDecryptUseCase1(t *testing.T, fileName string, aes bool, keyLeng
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opwWrong"
 	cmd = cli.DecryptCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s decrypt wrong opw, empty upw: %v\n", msg, outFile, err)
 	}
 }
 
 func ensurePermissionsNone(t *testing.T, listPermOutput []string) {
 	t.Helper()
-	if len(listPermOutput) == 0 || !strings.HasPrefix(listPermOutput[0], "permission bits:            0") {
+	if len(listPermOutput) == 0 || !strings.HasPrefix(listPermOutput[1], "permission bits: 000000000000") {
 		t.Fail()
 	}
 }
 
 func ensurePermissionsAll(t *testing.T, listPermOutput []string) {
 	t.Helper()
-	if len(listPermOutput) == 0 || listPermOutput[0] != "permission bits: 111100111100" {
+	if len(listPermOutput) == 0 || !strings.HasPrefix(listPermOutput[1], "permission bits: 111100111100") {
 		t.Fail()
 	}
 }
@@ -167,7 +168,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf.UserPW = "upw"
 	conf.OwnerPW = "opw"
 	cmd := cli.EncryptCommand(inFile, outFile, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: encrypt to %s: %v\n", msg, outFile, err)
 	}
 
@@ -177,7 +178,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf.UserPW = "upw"
 	conf.OwnerPW = "opw"
 	cmd = cli.EncryptCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s encrypt encrypted %s\n", msg, outFile)
 	}
 
@@ -206,7 +207,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf.OwnerPW = "opwWrong"
 	selectedPages := []string(nil) // writes w/o trimming anything, but sufficient for testing.
 	cmd = cli.TrimCommand(outFile, "", selectedPages, conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: trim %s using wrong ownerPW should fail: \n", msg, outFile)
 	}
 
@@ -215,17 +216,17 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf = confForAlgorithm(aes, keyLength)
 	conf.UserPW = "upw"
 	conf.OwnerPW = "opw"
-	conf.Permissions = pdfcpu.PermissionsAll
+	conf.Permissions = model.PermissionsAll
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s add permissions: %v\n", msg, outFile, err)
 	}
 
 	// List permissions
-	conf = pdfcpu.NewDefaultConfiguration()
+	conf = model.NewDefaultConfiguration()
 	conf.OwnerPW = "opw"
-	cmd = cli.ListPermissionsCommand(outFile, conf)
-	list, err := cli.Process(cmd)
+	cmd = cli.ListPermissionsCommand([]string{outFile}, conf)
+	list, err := cli.Dispatch(t.Context(), cmd)
 	if err != nil {
 		t.Fatalf("%s: list permissions for %s: %v\n", msg, outFile, err)
 	}
@@ -237,7 +238,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf.UserPW = "upw"
 	conf.OwnerPW = "opwWrong"
 	cmd = cli.SplitCommand(outFile, outDir, 1, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: trim %s using wrong ownerPW falls back to upw: \n", msg, outFile)
 	}
 
@@ -257,7 +258,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld := "upwWrong"
 	pwNew := "upwNew"
 	cmd = cli.ChangeUserPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: %s change userPW using wrong userPW should fail:\n", msg, outFile)
 	}
 
@@ -268,7 +269,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld = "upw"
 	pwNew = "upwNew"
 	cmd = cli.ChangeUserPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s change upw: %v\n", msg, outFile, err)
 	}
 
@@ -279,7 +280,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld = "opw"
 	pwNew = "opwNew"
 	cmd = cli.ChangeOwnerPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s change opw: %v\n", msg, outFile, err)
 	}
 
@@ -289,7 +290,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf.UserPW = "upwWrong"
 	conf.OwnerPW = "opwWrong"
 	cmd = cli.DecryptCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: decrypt using wrong pw %s\n", msg, outFile)
 	}
 
@@ -299,7 +300,7 @@ func testEncryptDecryptUseCase2(t *testing.T, fileName string, aes bool, keyLeng
 	conf.UserPW = "upwNew"
 	conf.OwnerPW = "opwNew"
 	cmd = cli.DecryptCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: decrypt %s: %v\n", msg, outFile, err)
 	}
 }
@@ -318,7 +319,7 @@ func testEncryptDecryptUseCase3(t *testing.T, fileName string, aes bool, keyLeng
 	conf := confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
 	cmd := cli.EncryptCommand(inFile, outFile, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: encrypt with opw only to to %s: %v\n", msg, outFile, err)
 	}
 
@@ -392,7 +393,7 @@ func testEncryptDecryptUseCase3(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld := "opw"
 	pwNew := "opwNew"
 	cmd = cli.ChangeOwnerPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: %s change opw using wrong upw should fail\n", msg, outFile)
 	}
 
@@ -403,7 +404,7 @@ func testEncryptDecryptUseCase3(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld = "opwOldWrong"
 	pwNew = "opwNew"
 	cmd = cli.ChangeOwnerPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: %s change opw using wrong upwOld should fail\n", msg, outFile)
 	}
 
@@ -414,7 +415,7 @@ func testEncryptDecryptUseCase3(t *testing.T, fileName string, aes bool, keyLeng
 	pwOld = "opw"
 	pwNew = "opwNew"
 	cmd = cli.ChangeOwnerPWCommand(outFile, "", &pwOld, &pwNew, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s change opw: %v\n", msg, outFile, err)
 	}
 
@@ -423,7 +424,7 @@ func testEncryptDecryptUseCase3(t *testing.T, fileName string, aes bool, keyLeng
 	conf = confForAlgorithm(aes, keyLength)
 	conf.UserPW = "upwWrong"
 	cmd = cli.DecryptCommand(outFile, "", conf)
-	if _, err := cli.Process(cmd); err == nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: %s decrypt using wrong upw should fail \n", msg, outFile)
 	}
 
@@ -432,7 +433,7 @@ func testEncryptDecryptUseCase3(t *testing.T, fileName string, aes bool, keyLeng
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
 	cmd = cli.DecryptCommand(outFile, outFile, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: %s decrypt using opw: %v\n", msg, outFile, err)
 	}
 }
@@ -445,54 +446,54 @@ func testPermissionsOPWOnly(t *testing.T, fileName string, aes bool, keyLength i
 	outFile := filepath.Join(outDir, "test.pdf")
 	t.Log(inFile)
 
-	cmd := cli.ListPermissionsCommand(inFile, nil)
-	list, err := cli.Process(cmd)
+	cmd := cli.ListPermissionsCommand([]string{inFile}, nil)
+	list, err := cli.Dispatch(t.Context(), cmd)
 	if err != nil {
 		t.Fatalf("%s: list permissions %s: %v\n", msg, inFile, err)
 	}
-	if len(list) == 0 || list[0] != "Full access" {
+	if len(list) == 0 || list[1] != "Full access" {
 		t.Fail()
 	}
 
 	conf := confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
 	cmd = cli.EncryptCommand(inFile, outFile, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: encrypt %s: %v\n", msg, outFile, err)
 	}
 
-	cmd = cli.ListPermissionsCommand(outFile, nil)
-	if list, err = cli.Process(cmd); err != nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, nil)
+	if list, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: list permissions %s: %v\n", msg, outFile, err)
 	}
 	ensurePermissionsNone(t, list)
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
-	conf.Permissions = pdfcpu.PermissionsAll
+	conf.Permissions = model.PermissionsAll
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err != nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: set all permissions for %s: %v\n", msg, outFile, err)
 	}
 
-	cmd = cli.ListPermissionsCommand(outFile, nil)
-	if list, err = cli.Process(cmd); err != nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, nil)
+	if list, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: list permissions for %s: %v\n", msg, outFile, err)
 	}
 	ensurePermissionsAll(t, list)
 
 	conf = confForAlgorithm(aes, keyLength)
-	conf.Permissions = pdfcpu.PermissionsNone
+	conf.Permissions = model.PermissionsNone
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err == nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: clear all permissions w/o opw for %s\n", msg, outFile)
 	}
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
-	conf.Permissions = pdfcpu.PermissionsNone
+	conf.Permissions = model.PermissionsNone
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err != nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: clear all permissions for %s: %v\n", msg, outFile, err)
 	}
 }
@@ -505,12 +506,12 @@ func testPermissions(t *testing.T, fileName string, aes bool, keyLength int) {
 	outFile := filepath.Join(outDir, "test.pdf")
 	t.Log(inFile)
 
-	cmd := cli.ListPermissionsCommand(inFile, nil)
-	list, err := cli.Process(cmd)
+	cmd := cli.ListPermissionsCommand([]string{inFile}, nil)
+	list, err := cli.Dispatch(t.Context(), cmd)
 	if err != nil {
 		t.Fatalf("%s: list permissions %s: %v\n", msg, inFile, err)
 	}
-	if len(list) == 0 || list[0] != "Full access" {
+	if len(list) == 0 || list[1] != "Full access" {
 		t.Fail()
 	}
 
@@ -518,72 +519,72 @@ func testPermissions(t *testing.T, fileName string, aes bool, keyLength int) {
 	conf.UserPW = "upw"
 	conf.OwnerPW = "opw"
 	cmd = cli.EncryptCommand(inFile, outFile, conf)
-	if _, err := cli.Process(cmd); err != nil {
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: encrypt %s: %v\n", msg, outFile, err)
 	}
 
-	cmd = cli.ListPermissionsCommand(outFile, nil)
-	if _, err = cli.Process(cmd); err == nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, nil)
+	if _, err = cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: list permissions w/o pw %s\n", msg, outFile)
 	}
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.UserPW = "upw"
-	cmd = cli.ListPermissionsCommand(outFile, conf)
-	if list, err = cli.Process(cmd); err != nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, conf)
+	if list, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: list permissions %s: %v\n", msg, outFile, err)
 	}
 	ensurePermissionsNone(t, list)
 
-	conf = pdfcpu.NewDefaultConfiguration()
+	conf = model.NewDefaultConfiguration()
 	conf.OwnerPW = "opw"
-	cmd = cli.ListPermissionsCommand(outFile, conf)
-	if list, err = cli.Process(cmd); err != nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, conf)
+	if list, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: list permissions %s: %v\n", msg, outFile, err)
 	}
 	ensurePermissionsNone(t, list)
 
 	conf = confForAlgorithm(aes, keyLength)
-	conf.Permissions = pdfcpu.PermissionsAll
+	conf.Permissions = model.PermissionsAll
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err == nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: set all permissions w/o pw for %s\n", msg, outFile)
 	}
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.UserPW = "upw"
-	conf.Permissions = pdfcpu.PermissionsAll
+	conf.Permissions = model.PermissionsAll
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err == nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: set all permissions w/o opw for %s\n", msg, outFile)
 	}
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
-	conf.Permissions = pdfcpu.PermissionsAll
+	conf.Permissions = model.PermissionsAll
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err == nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: set all permissions w/o both pws for %s\n", msg, outFile)
 	}
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
 	conf.UserPW = "upw"
-	conf.Permissions = pdfcpu.PermissionsAll
+	conf.Permissions = model.PermissionsAll
 	cmd = cli.SetPermissionsCommand(outFile, "", conf)
-	if _, err = cli.Process(cmd); err != nil {
+	if _, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: set all permissions for %s: %v\n", msg, outFile, err)
 	}
 
-	cmd = cli.ListPermissionsCommand(outFile, nil)
-	if _, err = cli.Process(cmd); err == nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, nil)
+	if _, err = cli.Dispatch(t.Context(), cmd); err == nil {
 		t.Fatalf("%s: list permissions w/o pw %s\n", msg, outFile)
 	}
 
 	conf = confForAlgorithm(aes, keyLength)
 	conf.OwnerPW = "opw"
-	cmd = cli.ListPermissionsCommand(outFile, conf)
-	if list, err = cli.Process(cmd); err != nil {
+	cmd = cli.ListPermissionsCommand([]string{outFile}, conf)
+	if list, err = cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s: list permissions for %s: %v\n", msg, outFile, err)
 	}
 	ensurePermissionsAll(t, list)
@@ -598,15 +599,96 @@ func testEncryptDecryptFile(t *testing.T, fileName string, mode string, keyLengt
 	testPermissions(t, fileName, mode == "aes", keyLength)
 }
 
+// TestEncryptDecrypt verifies encrypt decrypt.
 func TestEncryptDecrypt(t *testing.T) {
 	for _, fileName := range []string{
 		"5116.DCT_Filter.pdf",
-		"networkProgr.pdf",
+		"adobe_errata.pdf",
 	} {
 		testEncryptDecryptFile(t, fileName, "rc4", 40)
 		testEncryptDecryptFile(t, fileName, "rc4", 128)
 		testEncryptDecryptFile(t, fileName, "aes", 40)
 		testEncryptDecryptFile(t, fileName, "aes", 128)
 		testEncryptDecryptFile(t, fileName, "aes", 256)
+	}
+}
+
+// passwordFromFile reads an exact password value from a temporary secret file.
+func passwordFromFile(t *testing.T, value string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "password")
+	if err := os.WriteFile(path, []byte(value), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestEncryptionFileSecrets verifies encryption and password changes using caller-loaded file secrets.
+func TestEncryptionFileSecrets(t *testing.T) {
+	for _, algorithm := range []struct {
+		name string
+		aes  bool
+		bits int
+	}{
+		{"RC4-128", false, 128}, {"AES-128", true, 128}, {"AES-256", true, 256},
+	} {
+		t.Run(algorithm.name, func(t *testing.T) {
+			testEncryptionFileSecrets(t, algorithm.aes, algorithm.bits)
+		})
+	}
+}
+
+func testEncryptionFileSecrets(t *testing.T, aes bool, bits int) {
+	t.Helper()
+	user := passwordFromFile(t, "file-user")
+	owner := passwordFromFile(t, "file-owner")
+	newUser := passwordFromFile(t, "file-new-user")
+	newOwner := passwordFromFile(t, "file-new-owner")
+	encrypted := filepath.Join(t.TempDir(), "encrypted.pdf")
+	conf := confForAlgorithm(aes, bits)
+	conf.UserPW, conf.OwnerPW = user, owner
+	cmd := cli.EncryptCommand(filepath.Join(inDir, "5116.DCT_Filter.pdf"), encrypted, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFile(t, encrypted, nil); err == nil {
+		t.Fatal("encrypted document accepted without passwords")
+	}
+	cmd = cli.ChangeUserPWCommand(encrypted, "", &user, &newUser, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	conf.UserPW = newUser
+	cmd = cli.ChangeOwnerPWCommand(encrypted, "", &owner, &newOwner, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	stale := confForAlgorithm(aes, bits)
+	stale.UserPW, stale.OwnerPW = user, owner
+	if err := validateFile(t, encrypted, stale); err == nil {
+		t.Fatal("replaced passwords still accepted")
+	}
+	conf.OwnerPW = newOwner
+	if err := validateFile(t, encrypted, conf); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(t.TempDir(), "plain.pdf")
+	if _, err := cli.Dispatch(t.Context(), cli.DecryptCommand(encrypted, plain, conf)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFile(t, plain, nil); err != nil {
+		t.Fatal(err)
+	}
+	empty := passwordFromFile(t, "")
+	cmd = cli.ChangeUserPWCommand(encrypted, "", &newUser, &empty, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFile(t, encrypted, nil); err != nil {
+		t.Fatalf("empty user-password file did not remove the open password: %v", err)
 	}
 }

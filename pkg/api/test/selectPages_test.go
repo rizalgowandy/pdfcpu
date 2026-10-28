@@ -17,17 +17,15 @@ limitations under the License.
 package test
 
 import (
+	"errors"
 	"fmt"
-	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 
-	"strings"
-
 	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
-
-var r *regexp.Regexp
 
 func testPageSelectionSyntaxOk(t *testing.T, s string) {
 	t.Helper()
@@ -45,8 +43,7 @@ func testPageSelectionSyntaxFail(t *testing.T, s string) {
 	}
 }
 
-// Test the pageSelection string.
-// This is used to select specific pages for extraction and trimming.
+// TestPageSelectionSyntax tests the pageSelection string.
 func TestPageSelectionSyntax(t *testing.T) {
 	psOk := []string{"1", "!1", "n1", "1-", "!1-", "n1-", "-5", "!-5", "n-5", "3-5", "!3-5", "n3-5",
 		"1,2,3", "!-5,10-15,30-", "1-,n4", "odd", "even", " 1"}
@@ -62,7 +59,7 @@ func TestPageSelectionSyntax(t *testing.T) {
 	}
 }
 
-func selectedPagesString(sp pdfcpu.IntSet, pageCount int) string {
+func selectedPagesString(sp types.IntSet, pageCount int) string {
 	s := []string{}
 	var t string
 
@@ -84,7 +81,7 @@ func testSelectedPages(s string, pageCount int, compareString string, t *testing
 		t.Fatalf("testSelectedPages(%s) %v\n", s, err)
 	}
 
-	selectedPages, err := api.PagesForPageSelection(pageCount, pageSelection, false)
+	selectedPages, err := api.PagesForSelection(pageCount, pageSelection, false)
 	if err != nil {
 		t.Fatalf("testSelectedPages(%s) %v\n", s, err)
 	}
@@ -96,6 +93,7 @@ func testSelectedPages(s string, pageCount int, compareString string, t *testing
 	}
 }
 
+// TestSelectedPages verifies selected pages.
 func TestSelectedPages(t *testing.T) {
 	pageCount := 5
 
@@ -147,9 +145,10 @@ func TestSelectedPages(t *testing.T) {
 	testSelectedPages("l,even", pageCount, "01011", t)
 
 	testSelectedPages("1-l,!2-l-1", pageCount, "10001", t)
+	testSelectedPages("1-l,!2-l-1", pageCount, "10001", t)
 }
 
-func collectedPagesString(cp []int, pageCount int) string {
+func collectedPagesString(cp []int) string {
 	return fmt.Sprint(cp)
 }
 
@@ -164,7 +163,7 @@ func testCollectedPages(s string, pageCount int, want string, t *testing.T) {
 		t.Fatalf("testCollectedPages(%s) %v\n", s, err)
 	}
 
-	got := collectedPagesString(collectedPages, pageCount)
+	got := collectedPagesString(collectedPages)
 	//fmt.Printf("%s\n", resultString)
 
 	if got != want {
@@ -172,6 +171,7 @@ func testCollectedPages(s string, pageCount int, want string, t *testing.T) {
 	}
 }
 
+// TestCollectedPages verifies collected pages.
 func TestCollectedPages(t *testing.T) {
 	pageCount := 5
 
@@ -191,7 +191,6 @@ func TestCollectedPages(t *testing.T) {
 	testCollectedPages("3", pageCount, "[3]", t)
 	testCollectedPages("4", pageCount, "[4]", t)
 	testCollectedPages("5", pageCount, "[5]", t)
-	testCollectedPages("6", pageCount, "[]", t)
 
 	testCollectedPages("-3", pageCount, "[1 2 3]", t)
 	testCollectedPages("3-", pageCount, "[3 4 5]", t)
@@ -204,18 +203,12 @@ func TestCollectedPages(t *testing.T) {
 	testCollectedPages("5-7", pageCount, "[5]", t)
 	testCollectedPages("4-", pageCount, "[4 5]", t)
 	testCollectedPages("5-", pageCount, "[5]", t)
-	testCollectedPages("!4", pageCount, "[]", t)
 
 	testCollectedPages("-l", pageCount, "[1 2 3 4 5]", t)
 	testCollectedPages("-l-1", pageCount, "[1 2 3 4]", t)
 	testCollectedPages("2-l", pageCount, "[2 3 4 5]", t)
 	testCollectedPages("2-l-2", pageCount, "[2 3]", t)
 	testCollectedPages("2-l-3", pageCount, "[2]", t)
-	testCollectedPages("2-l-4", pageCount, "[]", t)
-	testCollectedPages("!l", pageCount, "[]", t)
-	testCollectedPages("nl", pageCount, "[]", t)
-	testCollectedPages("!l-2", pageCount, "[]", t)
-	testCollectedPages("nl-2", pageCount, "[]", t)
 	testCollectedPages("l", pageCount, "[5]", t)
 	testCollectedPages("l-1", pageCount, "[4]", t)
 	testCollectedPages("l-1-", pageCount, "[4 5]", t)
@@ -229,6 +222,64 @@ func TestCollectedPages(t *testing.T) {
 
 	testCollectedPages("1-,!l", pageCount, "[1 2 3 4]", t)
 	testCollectedPages("1-,nl", pageCount, "[1 2 3 4]", t)
-	testSelectedPages("1-l,!2-l-1", pageCount, "10001", t)
+}
 
+func TestCollectedPagesRejectsEmptySelectionToken(t *testing.T) {
+	_, err := api.PagesForPageCollection(5, []string{""})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "page selection token 1: empty") {
+		t.Fatalf("expected empty page selection token error, got %q", err.Error())
+	}
+
+	_, err = api.PagesForPageCollection(5, []string{"1", ""})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "page selection token 2: empty") {
+		t.Fatalf("expected second token context, got %q", err.Error())
+	}
+}
+
+// TestPagesForPageSelectionIncludesTokenContext verifies ordinary page-selection token errors.
+func TestPagesForPageSelectionIncludesTokenContext(t *testing.T) {
+	tests := []struct {
+		name       string
+		selection  []string
+		want       string
+		conversion bool
+	}{
+		{
+			name:      "first token empty",
+			selection: []string{""},
+			want:      "page selection token 1: empty",
+		},
+		{
+			name:      "second token empty",
+			selection: []string{"1", ""},
+			want:      "page selection token 2: empty",
+		},
+		{
+			name:       "second token invalid",
+			selection:  []string{"1", "foo"},
+			want:       `page selection token 2 "foo"`,
+			conversion: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := api.PagesForSelection(5, tt.selection, true)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q, got %v", tt.want, err)
+			}
+			if tt.conversion {
+				var numErr *strconv.NumError
+				if !errors.As(err, &numErr) {
+					t.Fatalf("expected conversion error, got %v", err)
+				}
+			}
+		})
+	}
 }

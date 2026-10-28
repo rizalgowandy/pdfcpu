@@ -18,11 +18,16 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"path/filepath"
 	"testing"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
-	pdf "github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/color"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/draw"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 var sampleText string = `MOST of the adventures recorded in this book really occurred; one or
@@ -156,66 +161,123 @@ delightful that they only made the aching voids between ache the harder.
 Becky Thatcher was gone to her Constantinople home to stay with her
 parents during vacation--so there was no bright side to life anywhere.`
 
-func createAndValidate(t *testing.T, xRefTable *pdf.XRefTable, outFile, msg string) {
+func createAndValidate(t *testing.T, xRefTable *model.XRefTable, outFile, msg string) {
 	t.Helper()
-	outDir := "../../samples/create"
+	outDir := "../../samples/basic"
 	outFile = filepath.Join(outDir, outFile)
-	if err := api.CreatePDFFile(xRefTable, outFile, nil); err != nil {
+	if err := api.CreatePDFFile(t.Context(), xRefTable, outFile, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
-	if err := api.ValidateFile(outFile, nil); err != nil {
+	if err := api.ValidateFile(t.Context(), outFile, nil, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
+// TestCreateDemoPDF verifies create demo PDF.
 func TestCreateDemoPDF(t *testing.T) {
 	msg := "TestCreateDemoPDF"
-	mediaBox := pdf.RectForFormat("A4")
-	p := pdf.Page{MediaBox: mediaBox, Fm: pdf.FontMap{}, Buf: new(bytes.Buffer)}
-	pdf.CreateTestPageContent(p)
-	xRefTable, err := pdf.CreateDemoXRef(p)
+	mediaBox := types.RectForFormat("A4")
+	p := model.Page{MediaBox: mediaBox, Fm: model.FontMap{}, Buf: new(bytes.Buffer)}
+	createTestPageContent(p)
+	xRefTable, err := pdfcpu.CreateXRefTableWithRootDict()
 	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	rootDict, err := xRefTable.Catalog()
+	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	if err = addPageTreeWithPage(t.Context(), xRefTable, rootDict, p); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 	createAndValidate(t, xRefTable, "Test.pdf", msg)
 }
 
+func firstPageTreeKid(t *testing.T, xRefTable *model.XRefTable, d types.Dict) types.Dict {
+	t.Helper()
+	kids, err := xRefTable.DereferenceArray(d["Kids"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kids) != 1 {
+		t.Fatalf("page-tree node: got %d kids, want 1", len(kids))
+	}
+	kid, err := xRefTable.DereferenceDict(kids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kid
+}
+
+func TestResourceDictInheritanceDemoUsesSingleAncestorResources(t *testing.T) {
+	xRefTable, err := createResourceDictInheritanceDemoXRef(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootDict, err := xRefTable.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPages, err := xRefTable.DereferenceDict(rootDict["Pages"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := xRefTable.DereferenceDict(rootPages["Resources"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fonts, err := xRefTable.DereferenceDict(resources["Font"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"F0", "F99", "F100"} {
+		if _, found := fonts.Find(id); !found {
+			t.Fatalf("page-tree root Resources: missing font %s", id)
+		}
+	}
+	intermediatePages := firstPageTreeKid(t, xRefTable, rootPages)
+	page := firstPageTreeKid(t, xRefTable, intermediatePages)
+	for name, d := range map[string]types.Dict{"intermediate page-tree node": intermediatePages, "page": page} {
+		if _, found := d.Find("Resources"); found {
+			t.Fatalf("%s: unexpected Resources", name)
+		}
+	}
+}
+
+// TestResourceDictInheritanceDemoPDF verifies resource dict inheritance demo PDF.
 func TestResourceDictInheritanceDemoPDF(t *testing.T) {
 	// Create a test page proofing resource inheritance.
 	// Resources may be inherited from ANY parent node.
 	// Case in point: fonts
 	msg := "TestResourceDictInheritanceDemoPDF"
-	xRefTable, err := pdf.CreateResourceDictInheritanceDemoXRef()
+	xRefTable, err := createResourceDictInheritanceDemoXRef(t.Context())
 	if err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 	createAndValidate(t, xRefTable, "ResourceDictInheritanceDemo.pdf", msg)
 }
 
+// TestAnnotationDemoPDF verifies annotation demo PDF.
 func TestAnnotationDemoPDF(t *testing.T) {
 	msg := "TestAnnotationDemoPDF"
-	xRefTable, err := pdf.CreateAnnotationDemoXRef()
+	xRefTable, err := createAnnotationDemoXRef(t.Context())
 	if err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 	createAndValidate(t, xRefTable, "AnnotationDemo.pdf", msg)
 }
 
-func TestAcroformDemoPDF(t *testing.T) {
-	msg := "TestAcroformDemoPDF"
-	xRefTable, err := pdf.CreateAcroFormDemoXRef()
+// TestFormDemoPDF verifies the form demo PDF.
+func TestFormDemoPDF(t *testing.T) {
+	msg := "TestFormDemoPDF"
+	xRefTable, err := createFormDemoXRef(t.Context())
 	if err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
-	createAndValidate(t, xRefTable, "AcroFormDemo.pdf", msg)
+	createAndValidate(t, xRefTable, "FormDemo.pdf", msg)
 }
 
-func writeTextDemoAlignedWidthAndMargin(
-	p pdf.Page,
-	region *pdf.Rectangle,
-	hAlign pdf.HAlignment,
-	w, mLeft, mRight, mTop, mBot float64) {
-
+func writeTextDemoAlignedWidthAndMargin(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, hAlign types.HAlignment, w, mLeft, mRight, mTop, mBot float64) {
 	buf := p.Buf
 	mediaBox := p.MediaBox
 
@@ -229,14 +291,15 @@ func writeTextDemoAlignedWidthAndMargin(
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	fontName := "Helvetica"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       24,
 		ShowMargins:    true,
@@ -247,132 +310,132 @@ func writeTextDemoAlignedWidthAndMargin(
 		Scale:          1.,
 		ScaleAbs:       true,
 		HAlign:         hAlign,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
-		FillCol:        pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
+		FillCol:        color.Black,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     true,
 		ShowTextBB:     true,
 		HairCross:      true,
 	}
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBaseline, -1, r.Height()*.75, "M\\u(lti\nline\n\nwith empty line"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBaseline, -1, r.Height()*.75, "M\\u(lti\nline\n\nwith empty line"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBaseline, r.Width()*.75, r.Height()*.25, "Arbitrary\ntext\nlines"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBaseline, r.Width()*.75, r.Height()*.25, "Arbitrary\ntext\nlines"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
 	// Multilines along the top of the page:
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignTop, 0, r.Height(), "0,h (topleft)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignTop, 0, r.Height(), "0,h (topleft)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignTop, -1, r.Height(), "-1,h (topcenter)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignTop, -1, r.Height(), "-1,h (topcenter)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignTop, r.Width(), r.Height(), "w,h (topright)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignTop, r.Width(), r.Height(), "w,h (topright)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
 	// Multilines along the center of the page:
 	// x = 0 centers the position of multilines horizontally
 	// y = 0 centers the position of multilines vertically and enforces alignMiddle
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBaseline, 0, -1, "0,-1 (left)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBaseline, 0, -1, "0,-1 (left)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignMiddle, -1, -1, "-1,-1 (center)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignMiddle, -1, -1, "-1,-1 (center)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBaseline, r.Width(), -1, "w,-1 (right)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBaseline, r.Width(), -1, "w,-1 (right)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
 	// Multilines along the bottom of the page:
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBottom, 0, 0, "0,0 (botleft)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBottom, 0, 0, "0,0 (botleft)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBottom, -1, 0, "-1,0 (botcenter)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBottom, -1, 0, "-1,0 (botcenter)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	td.VAlign, td.X, td.Y, td.Text = pdf.AlignBottom, r.Width(), 0, "w,0 (botright)\nand line2"
-	pdf.WriteColumn(buf, mediaBox, region, td, w)
+	td.VAlign, td.X, td.Y, td.Text = types.AlignBottom, r.Width(), 0, "w,0 (botright)\nand line2"
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, w)
 
-	pdf.DrawHairCross(buf, 0, 0, r)
+	draw.DrawHairCross(buf, 0, 0, r)
 }
 
-func createTextDemoAlignedWidthAndMargin(mediaBox *pdf.Rectangle, hAlign pdf.HAlignment, w, mLeft, mRight, mTop, mBot float64) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextDemoAlignedWidthAndMargin(p, region, hAlign, w, mLeft, mRight, mTop, mBot)
-	region = pdf.RectForWidthAndHeight(50, 70, 200, 200)
-	writeTextDemoAlignedWidthAndMargin(p, region, hAlign, w, mLeft, mRight, mTop, mBot)
+func createTextDemoAlignedWidthAndMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle, hAlign types.HAlignment, w, mLeft, mRight, mTop, mBot float64) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextDemoAlignedWidthAndMargin(c, xRefTable, p, region, hAlign, w, mLeft, mRight, mTop, mBot)
+	region = types.RectForWidthAndHeight(50, 70, 200, 200)
+	writeTextDemoAlignedWidthAndMargin(c, xRefTable, p, region, hAlign, w, mLeft, mRight, mTop, mBot)
 	return p
 }
 
-func createTextDemoAlignLeft(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignLeft, 0, 0, 0, 0, 0)
+func createTextDemoAlignLeft(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignLeft, 0, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignLeftMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignLeft, 0, 5, 10, 15, 20)
+func createTextDemoAlignLeftMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignLeft, 0, 5, 10, 15, 20)
 }
 
-func createTextDemoAlignRight(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignRight, 0, 0, 0, 0, 0)
+func createTextDemoAlignRight(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignRight, 0, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignRightMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignRight, 0, 5, 10, 15, 20)
+func createTextDemoAlignRightMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignRight, 0, 5, 10, 15, 20)
 }
 
-func createTextDemoAlignCenter(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignCenter, 0, 0, 0, 0, 0)
+func createTextDemoAlignCenter(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignCenter, 0, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignCenterMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignCenter, 0, 5, 10, 15, 20)
+func createTextDemoAlignCenterMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignCenter, 0, 5, 10, 15, 20)
 }
 
-func createTextDemoAlignJustify(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignJustify, 0, 0, 0, 0, 0)
+func createTextDemoAlignJustify(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignJustify, 0, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignJustifyMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignJustify, 0, 5, 10, 15, 20)
+func createTextDemoAlignJustifyMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignJustify, 0, 5, 10, 15, 20)
 }
 
-func createTextDemoAlignLeftWidth(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignLeft, 250, 0, 0, 0, 0)
+func createTextDemoAlignLeftWidth(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignLeft, 250, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignLeftWidthAndMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignLeft, 250, 5, 10, 15, 20)
+func createTextDemoAlignLeftWidthAndMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignLeft, 250, 5, 10, 15, 20)
 }
 
-func createTextDemoAlignRightWidth(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignRight, 250, 0, 0, 0, 0)
+func createTextDemoAlignRightWidth(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignRight, 250, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignRightWidthAndMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignRight, 250, 5, 10, 15, 20)
+func createTextDemoAlignRightWidthAndMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignRight, 250, 5, 10, 15, 20)
 }
 
-func createTextDemoAlignCenterWidth(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignCenter, 250, 0, 0, 0, 0)
+func createTextDemoAlignCenterWidth(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignCenter, 250, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignCenterWidthAndMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignCenter, 250, 5, 40, 15, 20)
+func createTextDemoAlignCenterWidthAndMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignCenter, 250, 5, 40, 15, 20)
 }
 
-func createTextDemoAlignJustifyWidth(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignJustify, 250, 0, 0, 0, 0)
+func createTextDemoAlignJustifyWidth(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignJustify, 250, 0, 0, 0, 0)
 }
 
-func createTextDemoAlignJustifyWidthAndMargin(mediaBox *pdf.Rectangle) pdf.Page {
-	return createTextDemoAlignedWidthAndMargin(mediaBox, pdf.AlignJustify, 250, 5, 10, 15, 20)
+func createTextDemoAlignJustifyWidthAndMargin(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	return createTextDemoAlignedWidthAndMargin(c, xRefTable, mediaBox, types.AlignJustify, 250, 5, 10, 15, 20)
 }
 
-func writeTextAlignJustifyDemo(p pdf.Page, region *pdf.Rectangle, fontName string) {
+func writeTextAlignJustifyDemo(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, fontName string) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -386,14 +449,15 @@ func writeTextAlignJustifyDemo(p pdf.Page, region *pdf.Rectangle, fontName strin
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		MLeft:          5,
@@ -404,25 +468,25 @@ func writeTextAlignJustifyDemo(p pdf.Page, region *pdf.Rectangle, fontName strin
 		Y:              -1,
 		Scale:          1.,
 		ScaleAbs:       true,
-		HAlign:         pdf.AlignJustify,
-		VAlign:         pdf.AlignMiddle,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.NewSimpleColor(0x206A29),
-		FillCol:        pdf.NewSimpleColor(0x206A29),
+		HAlign:         types.AlignJustify,
+		VAlign:         types.AlignMiddle,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.NewSimpleColor(0x206A29),
+		FillCol:        color.NewSimpleColor(0x206A29),
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
 		HairCross:      false,
 	}
 
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
 
-	pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
+	draw.DrawHairCross(p.Buf, 0, 0, mediaBox)
 }
 
-func writeTextAlignJustifyColumnDemo(p pdf.Page, region *pdf.Rectangle) {
+func writeTextAlignJustifyColumnDemo(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -436,7 +500,7 @@ func writeTextAlignJustifyColumnDemo(p pdf.Page, region *pdf.Rectangle) {
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	fontName := "Times-Roman"
@@ -444,63 +508,64 @@ func writeTextAlignJustifyColumnDemo(p pdf.Page, region *pdf.Rectangle) {
 	k1 := p.Fm.EnsureKey(fontName)
 	k2 := p.Fm.EnsureKey(fontName2)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText,
+		Embed:          true,
 		MLeft:          5,
 		MRight:         5,
 		MTop:           5,
 		MBot:           5,
 		Scale:          1.,
 		ScaleAbs:       true,
-		HAlign:         pdf.AlignJustify,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
-		FillCol:        pdf.Black,
+		HAlign:         types.AlignJustify,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
+		FillCol:        color.Black,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
 		HairCross:      false,
 	}
 
-	td.BackgroundCol = pdf.White
-	td.FillCol = pdf.Black
+	td.BackgroundCol = color.White
+	td.FillCol = color.Black
 	td.FontName, td.FontKey, td.FontSize = fontName, k1, 9
 	td.ParIndent = true
-	td.VAlign, td.X, td.Y, td.Dx, td.Dy = pdf.AlignTop, 0, r.Height(), 5, -5
-	pdf.WriteColumn(buf, mediaBox, region, td, 150)
+	td.VAlign, td.X, td.Y, td.Dx, td.Dy = types.AlignTop, 0, r.Height(), 5, -5
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, 150)
 
-	td.BackgroundCol = pdf.Black
-	td.FillCol = pdf.White
+	td.BackgroundCol = color.Black
+	td.FillCol = color.White
 	td.FontName, td.FontKey, td.FontSize = fontName2, k2, 12
 	td.ParIndent = true
-	td.VAlign, td.X, td.Y, td.Dx, td.Dy = pdf.AlignTop, -1, -1, 0, 0
-	pdf.WriteColumn(buf, mediaBox, region, td, 290)
+	td.VAlign, td.X, td.Y, td.Dx, td.Dy = types.AlignTop, -1, -1, 0, 0
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, 290)
 
-	pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
+	draw.DrawHairCross(p.Buf, 0, 0, mediaBox)
 }
 
-func createTextAlignJustifyDemo(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
+func createTextAlignJustifyDemo(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
 	fontName := "Times-Roman"
-	writeTextAlignJustifyDemo(p, region, fontName)
-	region = pdf.RectForWidthAndHeight(0, 0, 200, 200)
-	writeTextAlignJustifyDemo(p, region, fontName)
+	writeTextAlignJustifyDemo(c, xRefTable, p, region, fontName)
+	region = types.RectForWidthAndHeight(0, 0, 200, 200)
+	writeTextAlignJustifyDemo(c, xRefTable, p, region, fontName)
 	return p
 }
 
-func createTextAlignJustifyColumnDemo(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextAlignJustifyColumnDemo(p, region)
-	region = pdf.RectForWidthAndHeight(0, 0, 200, 200)
-	writeTextAlignJustifyColumnDemo(p, region)
+func createTextAlignJustifyColumnDemo(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextAlignJustifyColumnDemo(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(0, 0, 200, 200)
+	writeTextAlignJustifyColumnDemo(c, xRefTable, p, region)
 	return p
 }
 
-func writeTextDemoAnchorsWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy float64) {
+func writeTextDemoAnchorsWithOffset(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, dx, dy float64) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -514,14 +579,15 @@ func writeTextDemoAnchorsWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy fl
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	fontName := "Helvetica"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       24,
 		MLeft:          10,
@@ -530,11 +596,11 @@ func writeTextDemoAnchorsWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy fl
 		MBot:           10,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
-		FillCol:        pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
+		FillCol:        color.Black,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     true,
 		ShowTextBB:     true,
@@ -542,59 +608,59 @@ func writeTextDemoAnchorsWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy fl
 	}
 
 	td.Dx, td.Dy, td.Text = dx, -dy, "topleft\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft)
 
 	td.Dx, td.Dy, td.Text = 0, -dy, "topcenter\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter)
 
 	td.Dx, td.Dy, td.Text = -dx, -dy, "topright\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight)
 
 	td.Dx, td.Dy, td.Text = dx, 0, "left\nandline2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Left)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left)
 
 	td.Dx, td.Dy, td.Text = 0, 0, "center\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Center)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center)
 
 	td.Dx, td.Dy, td.Text = -dx, 0, "right\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Right)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right)
 
 	td.Dx, td.Dy, td.Text = dx, dy, "botleft\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft)
 
 	td.Dx, td.Dy, td.Text = 0, dy, "botcenter\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter)
 
 	td.Dx, td.Dy, td.Text = -dx, dy, "botright\nandLine2"
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight)
 
-	pdf.DrawHairCross(buf, 0, 0, r)
+	draw.DrawHairCross(buf, 0, 0, r)
 }
 
-func writeTextDemoAnchors(p pdf.Page, region *pdf.Rectangle) {
-	writeTextDemoAnchorsWithOffset(p, region, 0, 0)
+func writeTextDemoAnchors(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) {
+	writeTextDemoAnchorsWithOffset(c, xRefTable, p, region, 0, 0)
 }
 
-func createTextDemoAnchors(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextDemoAnchors(p, region)
-	region = pdf.RectForWidthAndHeight(50, 70, 200, 200)
-	writeTextDemoAnchors(p, region)
+func createTextDemoAnchors(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextDemoAnchors(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(50, 70, 200, 200)
+	writeTextDemoAnchors(c, xRefTable, p, region)
 	return p
 }
 
-func createTextDemoAnchorsWithOffset(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
+func createTextDemoAnchorsWithOffset(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
 	dx, dy := 20., 20.
-	var region *pdf.Rectangle
-	writeTextDemoAnchorsWithOffset(p, region, dx, dy)
-	region = pdf.RectForWidthAndHeight(50, 70, 200, 200)
-	writeTextDemoAnchorsWithOffset(p, region, dx, dy)
+	var region *types.Rectangle
+	writeTextDemoAnchorsWithOffset(c, xRefTable, p, region, dx, dy)
+	region = types.RectForWidthAndHeight(50, 70, 200, 200)
+	writeTextDemoAnchorsWithOffset(c, xRefTable, p, region, dx, dy)
 	return p
 }
 
-func writeTextDemoColumnAnchoredWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy float64) {
+func writeTextDemoColumnAnchoredWithOffset(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, dx, dy float64) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -608,7 +674,7 @@ func writeTextDemoColumnAnchoredWithOffset(p pdf.Page, region *pdf.Rectangle, dx
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	wSmall := 100.
@@ -617,9 +683,10 @@ func writeTextDemoColumnAnchoredWithOffset(p pdf.Page, region *pdf.Rectangle, dx
 	fontName := "Helvetica"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       6,
 		MLeft:          5,
@@ -628,11 +695,11 @@ func writeTextDemoColumnAnchoredWithOffset(p pdf.Page, region *pdf.Rectangle, dx
 		MBot:           5,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
-		FillCol:        pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
+		FillCol:        color.Black,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
@@ -640,77 +707,77 @@ func writeTextDemoColumnAnchoredWithOffset(p pdf.Page, region *pdf.Rectangle, dx
 	}
 
 	td.Dx, td.Dy = dx, -dy
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopLeft, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopLeft, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopLeft, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft, wBig)
 
 	td.Dx, td.Dy = 0, -dy
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopCenter, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopCenter, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopCenter, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter, wBig)
 
 	td.Dx, td.Dy = -dx, -dy
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopRight, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopRight, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.TopRight, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight, wBig)
 
 	td.Dx, td.Dy = dx, 0
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Left, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Left, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Left, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left, wBig)
 
 	td.Dx, td.Dy = 0, 0
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Center, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Center, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Center, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center, wBig)
 
 	td.Dx, td.Dy = -dx, 0
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Right, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Right, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.Right, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right, wBig)
 
 	td.Dx, td.Dy = dx, dy
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomLeft, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomLeft, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomLeft, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft, wBig)
 
 	td.Dx, td.Dy = 0, dy
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomCenter, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomCenter, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomCenter, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter, wBig)
 
 	td.Dx, td.Dy = -dx, dy
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomRight, wSmall)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomRight, 0)
-	pdf.WriteColumnAnchored(buf, mediaBox, region, td, pdf.BottomRight, wBig)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight, wSmall)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight, 0)
+	model.WriteColumnAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight, wBig)
 
-	pdf.DrawHairCross(buf, 0, 0, mediaBox)
+	draw.DrawHairCross(buf, 0, 0, mediaBox)
 }
 
-func writeTextDemoColumnAnchored(p pdf.Page, region *pdf.Rectangle) {
-	writeTextDemoColumnAnchoredWithOffset(p, region, 0, 0)
+func writeTextDemoColumnAnchored(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) {
+	writeTextDemoColumnAnchoredWithOffset(c, xRefTable, p, region, 0, 0)
 }
 
-func createTextDemoColumnAnchored(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextDemoColumnAnchored(p, region)
-	region = pdf.RectForWidthAndHeight(50, 70, 400, 400)
-	writeTextDemoColumnAnchored(p, region)
+func createTextDemoColumnAnchored(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextDemoColumnAnchored(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(50, 70, 400, 400)
+	writeTextDemoColumnAnchored(c, xRefTable, p, region)
 	return p
 }
 
-func createTextDemoColumnAnchoredWithOffset(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
+func createTextDemoColumnAnchoredWithOffset(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
 	dx, dy := 20., 20.
-	writeTextDemoColumnAnchoredWithOffset(p, region, dx, dy)
-	region = pdf.RectForWidthAndHeight(50, 70, 400, 400)
-	writeTextDemoColumnAnchoredWithOffset(p, region, dx, dy)
+	writeTextDemoColumnAnchoredWithOffset(c, xRefTable, p, region, dx, dy)
+	region = types.RectForWidthAndHeight(50, 70, 400, 400)
+	writeTextDemoColumnAnchoredWithOffset(c, xRefTable, p, region, dx, dy)
 	return p
 }
 
-func writeTextRotateDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy float64) {
+func writeTextRotateDemoWithOffset(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, dx, dy float64) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -724,18 +791,19 @@ func writeTextRotateDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy flo
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
-		pdf.DrawHairCross(buf, 0, 0, r)
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
+		draw.DrawHairCross(buf, 0, 0, r)
 	}
 
-	fillCol := pdf.Black
+	fillCol := color.Black
 
 	fontName := "Helvetica"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           "Hello Gopher!\nLine 2",
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       24,
 		MLeft:          10,
@@ -744,10 +812,10 @@ func writeTextRotateDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy flo
 		MBot:           10,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
@@ -756,101 +824,101 @@ func writeTextRotateDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy flo
 
 	td.Dx, td.Dy = dx, -dy
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopLeft)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{R: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopLeft)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopLeft)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{R: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopLeft)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{R: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopLeft)
 
 	td.Dx, td.Dy = 0, -dy
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopCenter)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{G: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopCenter)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{G: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopCenter)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{G: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopCenter)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{G: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopCenter)
 
 	td.Dx, td.Dy = -dx, -dy
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopRight)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{B: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopRight)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{B: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopRight)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{B: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopRight)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{B: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopRight)
 
 	td.Dx, td.Dy = dx, 0
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Left)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{R: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Left)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Left)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Left)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{R: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Left)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{R: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Left)
 
 	td.Dx, td.Dy = 0, 0
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Center)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{G: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Center)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{G: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Center)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Center)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{G: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Center)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{G: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Center)
 
 	td.Dx, td.Dy = -dx, 0
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Right)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{B: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Right)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{B: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Right)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Right)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{B: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Right)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{B: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Right)
 
 	td.Dx, td.Dy = dx, dy
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomLeft)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{R: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomLeft)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomLeft)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{R: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomLeft)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{R: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomLeft)
 
 	td.Dx, td.Dy = 0, dy
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomCenter)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{G: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomCenter)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{G: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomCenter)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{G: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomCenter)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{G: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomCenter)
 
 	td.Dx, td.Dy = -dx, dy
 	td.Rotation, td.FillCol = 0, fillCol
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomRight)
-	td.Rotation, td.FillCol = 45, pdf.SimpleColor{B: 1}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomRight)
-	td.Rotation, td.FillCol = 90, pdf.SimpleColor{B: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomRight)
+	td.Rotation, td.FillCol = 45, color.SimpleColor{B: 1}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomRight)
+	td.Rotation, td.FillCol = 90, color.SimpleColor{B: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomRight)
 }
 
-func writeTextRotateDemo(p pdf.Page, region *pdf.Rectangle) {
-	writeTextRotateDemoWithOffset(p, region, 0, 0)
+func writeTextRotateDemo(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) {
+	writeTextRotateDemoWithOffset(c, xRefTable, p, region, 0, 0)
 }
 
-func createTextRotateDemo(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextRotateDemo(p, region)
-	region = pdf.RectForWidthAndHeight(150, 150, 300, 300)
-	writeTextRotateDemo(p, region)
+func createTextRotateDemo(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextRotateDemo(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(150, 150, 300, 300)
+	writeTextRotateDemo(c, xRefTable, p, region)
 	return p
 }
 
-func createTextRotateDemoWithOffset(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
+func createTextRotateDemoWithOffset(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
 	dx, dy := 20., 20.
-	writeTextRotateDemoWithOffset(p, region, dx, dy)
-	region = pdf.RectForWidthAndHeight(150, 150, 300, 300)
-	writeTextRotateDemoWithOffset(p, region, dx, dy)
+	writeTextRotateDemoWithOffset(c, xRefTable, p, region, dx, dy)
+	region = types.RectForWidthAndHeight(150, 150, 300, 300)
+	writeTextRotateDemoWithOffset(c, xRefTable, p, region, dx, dy)
 	return p
 }
 
-func writeTextScaleAbsoluteDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy float64) {
+func writeTextScaleAbsoluteDemoWithOffset(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, dx, dy float64) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -864,18 +932,19 @@ func writeTextScaleAbsoluteDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
-	fillCol := pdf.Black
-	bgCol := pdf.SimpleColor{R: 1., G: .98, B: .77}
+	fillCol := color.Black
+	bgCol := color.SimpleColor{R: 1., G: .98, B: .77}
 
 	fontName := "Helvetica"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       18,
 		MLeft:          5,
@@ -883,8 +952,8 @@ func writeTextScaleAbsoluteDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 		MTop:           5,
 		MBot:           5,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
 		BackgroundCol:  bgCol,
 		ShowBorder:     true,
@@ -893,39 +962,40 @@ func writeTextScaleAbsoluteDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 		HairCross:      false,
 	}
 
-	td.HAlign, td.VAlign, td.X, td.Y, td.FontSize = pdf.AlignJustify, pdf.AlignMiddle, -1, r.Height()*.72, 9
+	td.HAlign, td.VAlign, td.X, td.Y, td.FontSize = types.AlignJustify, types.AlignMiddle, -1, r.Height()*.72, 9
 	td.Scale, td.FillCol = 1, fillCol
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
-	td.Scale, td.FillCol = 1.5, pdf.SimpleColor{R: 1}
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
-	td.Scale, td.FillCol = 2, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
+	td.Scale, td.FillCol = 1.5, color.SimpleColor{R: 1}
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
+	td.Scale, td.FillCol = 2, color.SimpleColor{R: .5}
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
 
 	width := 130.
 
-	td.HAlign, td.VAlign, td.X = pdf.AlignJustify, pdf.AlignMiddle, r.Width()*.75
+	td.HAlign, td.VAlign, td.X = types.AlignJustify, types.AlignMiddle, r.Width()*.75
 	td.FillCol, td.Text = fillCol, "Justified column\nWidth=130"
 
 	td.FontSize, td.Y = 24, r.Height()*.35
 	td.Scale = 1
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 	td.Scale = 1.5
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 
 	td.FontSize, td.Y = 12, r.Height()*.22
 	td.Scale = 1
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 	td.Scale = 1.5
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 
 	td.FontSize = 9
 	td.Scale, td.Y = 1, r.Height()*.15
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 	td.Scale, td.Y = 1.5, r.Height()*.13
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 
-	td = pdf.TextDescriptor{
+	td = model.TextDescriptor{
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		MLeft:          5,
@@ -933,8 +1003,8 @@ func writeTextScaleAbsoluteDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 		MTop:           5,
 		MBot:           5,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
 		BackgroundCol:  bgCol,
 		ShowBorder:     true,
@@ -949,103 +1019,103 @@ func writeTextScaleAbsoluteDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 
 	td.Dx, td.Dy = dx, -dy
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopLeft)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{R: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopLeft)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{R: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopLeft)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{R: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopLeft)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{R: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopLeft)
 
 	td.Dx, td.Dy = 0, -dy
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopCenter)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{G: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopCenter)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{G: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopCenter)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{G: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopCenter)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{G: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopCenter)
 
 	td.Dx, td.Dy = -dx, -dy
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopRight)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{B: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopRight)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{B: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.TopRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopRight)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{B: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopRight)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{B: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.TopRight)
 
 	td.Dx, td.Dy = dx, 0
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Left)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{R: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Left)
-	td.Scale, td.FillCol = .5, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Left)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Left)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{R: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Left)
+	td.Scale, td.FillCol = .5, color.SimpleColor{R: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Left)
 
 	td.Dx, td.Dy = 0, 0
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Center)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{G: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Center)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{G: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Center)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Center)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{G: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Center)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{G: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Center)
 
 	td.Dx, td.Dy = -dx, 0
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Right)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{B: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Right)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{B: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.Right)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Right)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{B: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Right)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{B: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.Right)
 
 	td.Dx, td.Dy = dx, dy
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomLeft)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{R: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomLeft)
-	td.Scale, td.FillCol = .5, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomLeft)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{R: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomLeft)
+	td.Scale, td.FillCol = .5, color.SimpleColor{R: .5}
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomLeft)
 
 	td.Dx, td.Dy = 0, dy
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomCenter)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{G: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomCenter)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{G: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomCenter)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{G: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomCenter)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{G: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomCenter)
 
 	td.Dx, td.Dy = -dx, +dy
 	td.Scale, td.FillCol, td.Text = 1.5, fillCol, text15
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomRight)
-	td.Scale, td.FillCol, td.Text = 1, pdf.SimpleColor{B: 1}, text1
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomRight)
-	td.Scale, td.FillCol, td.Text = .5, pdf.SimpleColor{B: .5}, text5
-	pdf.WriteMultiLineAnchored(buf, mediaBox, r, td, pdf.BottomRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomRight)
+	td.Scale, td.FillCol, td.Text = 1, color.SimpleColor{B: 1}, text1
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomRight)
+	td.Scale, td.FillCol, td.Text = .5, color.SimpleColor{B: .5}, text5
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, r, td, types.BottomRight)
 
-	pdf.DrawHairCross(buf, 0, 0, r)
+	draw.DrawHairCross(buf, 0, 0, r)
 }
 
-func writeTextScaleAbsoluteDemo(p pdf.Page, region *pdf.Rectangle) {
-	writeTextScaleAbsoluteDemoWithOffset(p, region, 0, 0)
+func writeTextScaleAbsoluteDemo(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) {
+	writeTextScaleAbsoluteDemoWithOffset(c, xRefTable, p, region, 0, 0)
 }
 
-func createTextScaleAbsoluteDemo(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextScaleAbsoluteDemo(p, region)
-	region = pdf.RectForWidthAndHeight(20, 70, 180, 180)
-	writeTextScaleAbsoluteDemo(p, region)
+func createTextScaleAbsoluteDemo(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextScaleAbsoluteDemo(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(20, 70, 180, 180)
+	writeTextScaleAbsoluteDemo(c, xRefTable, p, region)
 	return p
 }
 
-func createTextScaleAbsoluteDemoWithOffset(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
+func createTextScaleAbsoluteDemoWithOffset(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
 	dx, dy := 20., 20.
-	var region *pdf.Rectangle
-	writeTextScaleAbsoluteDemoWithOffset(p, region, dx, dy)
-	region = pdf.RectForWidthAndHeight(20, 70, 180, 180)
-	writeTextScaleAbsoluteDemoWithOffset(p, region, dx, dy)
+	var region *types.Rectangle
+	writeTextScaleAbsoluteDemoWithOffset(c, xRefTable, p, region, dx, dy)
+	region = types.RectForWidthAndHeight(20, 70, 180, 180)
+	writeTextScaleAbsoluteDemoWithOffset(c, xRefTable, p, region, dx, dy)
 	return p
 }
 
-func writeTextScaleRelativeDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx, dy float64) {
+func writeTextScaleRelativeDemoWithOffset(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, dx, dy float64) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -1059,31 +1129,32 @@ func writeTextScaleRelativeDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
-	fillCol := pdf.Black
-	bgCol := pdf.SimpleColor{R: 1., G: .98, B: .77}
+	fillCol := color.Black
+	bgCol := color.SimpleColor{R: 1., G: .98, B: .77}
 
 	fontName := "Helvetica"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       18,
 		MLeft:          5,
 		MRight:         5,
 		MTop:           5,
 		MBot:           5,
-		HAlign:         pdf.AlignJustify,
-		VAlign:         pdf.AlignMiddle,
+		HAlign:         types.AlignJustify,
+		VAlign:         types.AlignMiddle,
 		X:              -1,
 		Y:              r.Height() * .73,
 		ScaleAbs:       false,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
 		BackgroundCol:  bgCol,
 		ShowBorder:     true,
@@ -1093,30 +1164,31 @@ func writeTextScaleRelativeDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 	}
 
 	td.FontSize, td.Scale, td.FillCol = 9, .4, fillCol
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
-	td.FontSize, td.Scale, td.FillCol = 9, .6, pdf.SimpleColor{R: 1}
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
-	td.FontSize, td.Scale, td.FillCol = 9, .8, pdf.SimpleColor{R: .5}
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
+	td.FontSize, td.Scale, td.FillCol = 9, .6, color.SimpleColor{R: 1}
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
+	td.FontSize, td.Scale, td.FillCol = 9, .8, color.SimpleColor{R: .5}
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
 
 	width := 130.
 
-	td = pdf.TextDescriptor{
+	td = model.TextDescriptor{
 		Text:           "Justified column\nWidth=130",
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       18,
 		MLeft:          5,
 		MRight:         5,
 		MTop:           5,
 		MBot:           5,
-		HAlign:         pdf.AlignJustify,
-		VAlign:         pdf.AlignMiddle,
+		HAlign:         types.AlignJustify,
+		VAlign:         types.AlignMiddle,
 		X:              r.Width() * .75,
 		Y:              r.Height() * .25,
 		ScaleAbs:       false,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
 		BackgroundCol:  bgCol,
 		ShowBorder:     true,
@@ -1125,27 +1197,28 @@ func writeTextScaleRelativeDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 		HairCross:      false,
 	}
 	td.Scale, td.FillCol = .5, fillCol
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
-	td.Scale, td.FillCol = .3, pdf.SimpleColor{G: 1}
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
-	td.Scale, td.FillCol = .20, pdf.SimpleColor{G: .5}
-	pdf.WriteColumn(buf, mediaBox, region, td, width)
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
+	td.Scale, td.FillCol = .3, color.SimpleColor{G: 1}
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
+	td.Scale, td.FillCol = .20, color.SimpleColor{G: .5}
+	model.WriteColumn(c, xRefTable, buf, mediaBox, region, td, width)
 
-	td = pdf.TextDescriptor{
+	td = model.TextDescriptor{
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       18,
 		MLeft:          5,
 		MRight:         5,
 		MTop:           5,
 		MBot:           5,
-		HAlign:         pdf.AlignJustify,
-		VAlign:         pdf.AlignMiddle,
+		HAlign:         types.AlignJustify,
+		VAlign:         types.AlignMiddle,
 		X:              r.Width() * .75,
 		Y:              r.Height() * .25,
 		ScaleAbs:       false,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
 		BackgroundCol:  bgCol,
 		ShowBorder:     true,
@@ -1160,108 +1233,109 @@ func writeTextScaleRelativeDemoWithOffset(p pdf.Page, region *pdf.Rectangle, dx,
 
 	td.Dx, td.Dy = dx, -dy
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopLeft)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{R: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopLeft)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{R: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{R: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{R: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopLeft)
 
 	td.Dx, td.Dy = 0, -dy
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopCenter)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{G: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopCenter)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{G: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{G: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{G: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopCenter)
 
 	td.Dx, td.Dy = -dx, -dy
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopRight)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{B: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopRight)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{B: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.TopRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{B: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{B: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.TopRight)
 
 	td.Dx, td.Dy = dx, 0
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Left)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{R: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Left)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{R: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Left)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{R: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{R: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Left)
 
 	td.Dx, td.Dy = 0, 0
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Center)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{G: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Center)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{G: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Center)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{G: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{G: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Center)
 
 	td.Dx, td.Dy = -dx, 0
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Right)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{B: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Right)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{B: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.Right)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{B: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{B: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.Right)
 
 	td.Dx, td.Dy = dx, dy
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomLeft)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{R: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomLeft)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{R: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomLeft)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{R: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{R: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomLeft)
 
 	td.Dx, td.Dy = 0, dy
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomCenter)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{G: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomCenter)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{G: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomCenter)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{G: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{G: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomCenter)
 
 	td.Dx, td.Dy = -dx, dy
 	td.Scale, td.FillCol, td.Text = .3, fillCol, text30
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomRight)
-	td.Scale, td.FillCol, td.Text = .2, pdf.SimpleColor{B: 1}, text20
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomRight)
-	td.Scale, td.FillCol, td.Text = .1, pdf.SimpleColor{B: .5}, text10
-	pdf.WriteMultiLineAnchored(buf, mediaBox, region, td, pdf.BottomRight)
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight)
+	td.Scale, td.FillCol, td.Text = .2, color.SimpleColor{B: 1}, text20
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight)
+	td.Scale, td.FillCol, td.Text = .1, color.SimpleColor{B: .5}, text10
+	model.WriteMultiLineAnchored(c, xRefTable, buf, mediaBox, region, td, types.BottomRight)
 
-	pdf.DrawHairCross(buf, 0, 0, r)
+	draw.DrawHairCross(buf, 0, 0, r)
 }
 
-func writeTextScaleRelativeDemo(p pdf.Page, region *pdf.Rectangle) {
-	writeTextScaleRelativeDemoWithOffset(p, region, 0, 0)
+func writeTextScaleRelativeDemo(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) {
+	writeTextScaleRelativeDemoWithOffset(c, xRefTable, p, region, 0, 0)
 }
 
-func createTextScaleRelativeDemo(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writeTextScaleRelativeDemo(p, region)
-	region = pdf.RectForWidthAndHeight(50, 70, 200, 200)
-	writeTextScaleRelativeDemo(p, region)
+func createTextScaleRelativeDemo(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writeTextScaleRelativeDemo(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(50, 70, 200, 200)
+	writeTextScaleRelativeDemo(c, xRefTable, p, region)
 	return p
 }
 
-func createTextScaleRelativeDemoWithOffset(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
+func createTextScaleRelativeDemoWithOffset(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
 	dx, dy := 20., 20.
-	writeTextScaleRelativeDemoWithOffset(p, region, dx, dy)
-	region = pdf.RectForWidthAndHeight(50, 70, 200, 200)
-	writeTextScaleRelativeDemoWithOffset(p, region, dx, dy)
+	writeTextScaleRelativeDemoWithOffset(c, xRefTable, p, region, dx, dy)
+	region = types.RectForWidthAndHeight(50, 70, 200, 200)
+	writeTextScaleRelativeDemoWithOffset(c, xRefTable, p, region, dx, dy)
 	return p
 }
 
-func createTextDemoColumns(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPageWithBg(mediaBox, pdf.NewSimpleColor(0xbeded9))
+func createTextDemoColumns(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPageWithBg(mediaBox, color.NewSimpleColor(0xbeded9))
 	fontName := "Times-Roman"
 	k := p.Fm.EnsureKey(fontName)
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       9,
 		MLeft:          10,
@@ -1270,8 +1344,8 @@ func createTextDemoColumns(mediaBox *pdf.Rectangle) pdf.Page {
 		MBot:           10,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.Black,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.Black,
 		ShowBackground: true,
 		BorderWidth:    3,
 	}
@@ -1285,18 +1359,18 @@ func createTextDemoColumns(mediaBox *pdf.Rectangle) pdf.Page {
 	// Draw the bounding box with rounded corners but no borders.
 	td.Text = sampleText
 	td.ShowTextBB, td.ShowBorder = true, false
-	td.BackgroundCol = pdf.SimpleColor{R: .4, G: .98, B: .77}
-	td.BorderStyle = pdf.LJRound
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, nil, td, pdf.TopLeft, width)
+	td.BackgroundCol = color.SimpleColor{R: .4, G: .98, B: .77}
+	td.BorderStyle = types.LJRound
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, nil, td, types.TopLeft, width)
 
 	// Render middle column.
 	// Draw the bounding box with regular corners but no border.
 	td.Text = sampleText2
 	td.Dx = -width / 2
 	td.ShowTextBB, td.ShowBorder = true, false
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJMiter
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, nil, td, pdf.TopCenter, width)
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJMiter
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, nil, td, types.TopCenter, width)
 
 	// Render right column.
 	// Draw bounding box and a border with rounded corners.
@@ -1304,10 +1378,10 @@ func createTextDemoColumns(mediaBox *pdf.Rectangle) pdf.Page {
 	td.Text = sampleText3
 	td.Dx = 0
 	td.ShowTextBB, td.ShowBorder = true, true
-	td.BackgroundCol = pdf.SimpleColor{R: 1., G: .98, B: .77}
-	td.BorderCol = pdf.SimpleColor{R: .2, G: .5, B: .2}
-	td.BorderStyle = pdf.LJRound
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, nil, td, pdf.TopRight, width)
+	td.BackgroundCol = color.SimpleColor{R: 1., G: .98, B: .77}
+	td.BorderCol = color.SimpleColor{R: .2, G: .5, B: .2}
+	td.BorderStyle = types.LJRound
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, nil, td, types.TopRight, width)
 
 	// 2nd row: 3 side by side columns below using relative scaling,
 	// Indent paragraph beginnings and don't draw the background.
@@ -1317,35 +1391,36 @@ func createTextDemoColumns(mediaBox *pdf.Rectangle) pdf.Page {
 	td.ScaleAbs = false
 	td.ParIndent = true
 	td.ShowBackground, td.ShowBorder = false, true
-	td.HAlign, td.VAlign = pdf.AlignJustify, pdf.AlignTop
+	td.HAlign, td.VAlign = types.AlignJustify, types.AlignTop
 
 	// Render left column.
 	td.Text = sampleText
 	td.X = 0
 	td.ShowTextBB = true
-	td.BorderStyle = pdf.LJBevel
-	pdf.WriteMultiLine(p.Buf, mediaBox, nil, td)
+	td.BorderStyle = types.LJBevel
+	model.WriteMultiLine(c, xRefTable, p.Buf, mediaBox, nil, td)
 
 	// Render middle column.
 	td.Text = sampleText2
 	td.X = mediaBox.Width() / 2
+	td.Dx = -width / 2
 	td.ShowTextBB = false
-	pdf.WriteMultiLine(p.Buf, mediaBox, nil, td)
+	model.WriteMultiLine(c, xRefTable, p.Buf, mediaBox, nil, td)
 
 	// Render right column.
 	td.Text = sampleText3
 	td.X = mediaBox.Width()
 	td.Dx = 0
 	td.ShowTextBB = true
-	td.BorderStyle = pdf.LJMiter
-	pdf.WriteMultiLine(p.Buf, mediaBox, nil, td)
+	td.BorderStyle = types.LJMiter
+	model.WriteMultiLine(c, xRefTable, p.Buf, mediaBox, nil, td)
 
-	pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
+	draw.DrawHairCross(p.Buf, 0, 0, mediaBox)
 
 	return p
 }
 
-func writeTextBorderTest(p pdf.Page, region *pdf.Rectangle) pdf.Page {
+func writeTextBorderTest(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle) model.Page {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -1359,13 +1434,14 @@ func writeTextBorderTest(p pdf.Page, region *pdf.Rectangle) pdf.Page {
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	fontName := "Times-Roman"
 	k := p.Fm.EnsureKey(fontName)
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		FontName:   fontName,
+		Embed:      true,
 		FontKey:    k,
 		FontSize:   7,
 		MLeft:      10,
@@ -1374,8 +1450,8 @@ func writeTextBorderTest(p pdf.Page, region *pdf.Rectangle) pdf.Page {
 		MBot:       10,
 		Scale:      1.,
 		ScaleAbs:   true,
-		RMode:      pdf.RMFill,
-		BorderCol:  pdf.NewSimpleColor(0xabe003),
+		RMode:      draw.RMFill,
+		BorderCol:  color.NewSimpleColor(0xabe003),
 		ShowTextBB: true,
 	}
 
@@ -1386,103 +1462,107 @@ func writeTextBorderTest(p pdf.Page, region *pdf.Rectangle) pdf.Page {
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = false, false, false
 	td.MBot, td.MTop, td.MLeft, td.MRight = 0, 0, 0, 0
 	td.BorderWidth = 0
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJMiter
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.TopLeft, w)
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJMiter
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.TopLeft, w)
 
 	// with background, no margin, no border
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, false, false
 	td.MBot, td.MTop, td.MLeft, td.MRight = 0, 0, 0, 0
 	td.BorderWidth = 0
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.TopCenter, w)
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.TopCenter, w)
 
 	// with background, with margins, no border
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, false, false
 	td.MBot, td.MTop, td.MLeft, td.MRight = 10, 10, 10, 10
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
 	td.Dy = 100
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.Left, w)
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.Left, w)
 
 	// with background, with margins, show margins, no border
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, false, true
 	td.MBot, td.MTop, td.MLeft, td.MRight = 10, 10, 10, 10
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJMiter
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJMiter
 	td.Dy = 100
-	bb := pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.Center, w)
+	bb, err := model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.Center, w)
+	if err != nil {
+		panic(err)
+	}
 
 	// with background, no margin, with border, without border background
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, false, false
 	td.BorderWidth = 5
 	td.MBot, td.MTop, td.MLeft, td.MRight = 0, 0, 0, 0
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJRound
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJRound
 	td.Dy = -bb.Height() / 2
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.Left, w)
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.Left, w)
 
 	// with background, no margin, with border, with border background
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, true, false
 	td.BorderWidth = 5
 	td.MBot, td.MTop, td.MLeft, td.MRight = 0, 0, 0, 0
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJRound
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJRound
 	td.Dy = -bb.Height() / 2
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.Center, w)
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.Center, w)
 
 	// with background, with margins, with border, with border background
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, true, false
 	td.BorderWidth = 5
 	td.MBot, td.MTop, td.MLeft, td.MRight = 10, 10, 10, 10
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJRound
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJRound
 	td.Dy = 0
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.BottomLeft, w)
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.BottomLeft, w)
 
 	// with background, with margins, show margins, with border, with border background
 	td.Text = sampleText2
 	td.ShowBackground, td.ShowBorder, td.ShowMargins = true, true, true
 	td.BorderWidth = 5
 	td.MBot, td.MTop, td.MLeft, td.MRight = 10, 10, 10, 10
-	td.BackgroundCol = pdf.SimpleColor{R: .6, G: .98, B: .77}
-	td.BorderStyle = pdf.LJRound
+	td.BackgroundCol = color.SimpleColor{R: .6, G: .98, B: .77}
+	td.BorderStyle = types.LJRound
 	td.Dy = 0
-	pdf.WriteColumnAnchored(p.Buf, mediaBox, region, td, pdf.BottomCenter, w)
+	model.WriteColumnAnchored(c, xRefTable, p.Buf, mediaBox, region, td, types.BottomCenter, w)
 
-	pdf.DrawHairCross(p.Buf, 0, 0, r)
+	draw.DrawHairCross(p.Buf, 0, 0, r)
 
 	return p
 }
 
-func createTextBorderTest(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPageWithBg(mediaBox, pdf.NewSimpleColor(0xbeded9))
-	var region *pdf.Rectangle
-	writeTextBorderTest(p, region)
-	region = pdf.RectForWidthAndHeight(70, 200, 200, 200)
-	writeTextBorderTest(p, region)
+func createTextBorderTest(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPageWithBg(mediaBox, color.NewSimpleColor(0xbeded9))
+	var region *types.Rectangle
+	writeTextBorderTest(c, xRefTable, p, region)
+	region = types.RectForWidthAndHeight(70, 200, 200, 200)
+	writeTextBorderTest(c, xRefTable, p, region)
 	return p
 }
 
-func createTextBorderNoMarginAlignLeftTest(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPageWithBg(mediaBox, pdf.NewSimpleColor(0xbeded9))
+func createTextBorderNoMarginAlignLeftTest(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPageWithBg(mediaBox, color.NewSimpleColor(0xbeded9))
 	fontName := "Times-Roman"
 	k := p.Fm.EnsureKey(fontName)
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText2,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
+		RMode:          draw.RMFill,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: .6, G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: .6, G: .98, B: .77},
 		ShowBorder:     true,
 		BorderWidth:    10,
 		ShowMargins:    true,
@@ -1490,42 +1570,43 @@ func createTextBorderNoMarginAlignLeftTest(mediaBox *pdf.Rectangle) pdf.Page {
 		MRight:         10,
 		MTop:           10,
 		MBot:           10,
-		BorderCol:      pdf.NewSimpleColor(0xabe003),
+		BorderCol:      color.NewSimpleColor(0xabe003),
 		ShowTextBB:     true,
 	}
 
-	td.X, td.Y, td.HAlign, td.VAlign = 100, 450, pdf.AlignLeft, pdf.AlignTop
+	td.X, td.Y, td.HAlign, td.VAlign = 100, 450, types.AlignLeft, types.AlignTop
 	td.MinHeight = 300
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 400)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 400)
 
-	pdf.SetLineWidth(p.Buf, 0)
-	pdf.SetStrokeColor(p.Buf, pdf.Black)
-	pdf.DrawLine(p.Buf, 100, 0, 100, 600)
-	pdf.DrawLine(p.Buf, 500, 0, 500, 600)
-	pdf.DrawLine(p.Buf, 110, 0, 110, 600)
-	pdf.DrawLine(p.Buf, 490, 0, 490, 600)
-	pdf.DrawLine(p.Buf, 0, 150, 600, 150)
-	pdf.DrawLine(p.Buf, 0, 450, 600, 450)
-	pdf.DrawLine(p.Buf, 0, 160, 600, 160)
-	pdf.DrawLine(p.Buf, 0, 440, 600, 440)
+	draw.SetLineWidth(p.Buf, 0)
+	draw.SetStrokeColor(p.Buf, color.Black)
+	draw.DrawLineSimple(p.Buf, 100, 0, 100, 600)
+	draw.DrawLineSimple(p.Buf, 500, 0, 500, 600)
+	draw.DrawLineSimple(p.Buf, 110, 0, 110, 600)
+	draw.DrawLineSimple(p.Buf, 490, 0, 490, 600)
+	draw.DrawLineSimple(p.Buf, 0, 150, 600, 150)
+	draw.DrawLineSimple(p.Buf, 0, 450, 600, 450)
+	draw.DrawLineSimple(p.Buf, 0, 160, 600, 160)
+	draw.DrawLineSimple(p.Buf, 0, 440, 600, 440)
 	//pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
 	return p
 }
 
-func createTextBorderNoMarginAlignRightTest(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPageWithBg(mediaBox, pdf.NewSimpleColor(0xbeded9))
+func createTextBorderNoMarginAlignRightTest(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPageWithBg(mediaBox, color.NewSimpleColor(0xbeded9))
 	fontName := "Times-Roman"
 	k := p.Fm.EnsureKey(fontName)
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText2,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
+		RMode:          draw.RMFill,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: .6, G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: .6, G: .98, B: .77},
 		ShowBorder:     true,
 		BorderWidth:    10,
 		ShowMargins:    true,
@@ -1533,45 +1614,46 @@ func createTextBorderNoMarginAlignRightTest(mediaBox *pdf.Rectangle) pdf.Page {
 		MRight:         10,
 		MTop:           10,
 		MBot:           10,
-		BorderCol:      pdf.NewSimpleColor(0xabe003),
+		BorderCol:      color.NewSimpleColor(0xabe003),
 		ShowTextBB:     true,
 	}
 
-	td.X, td.Y, td.HAlign, td.VAlign = 500, 450, pdf.AlignRight, pdf.AlignTop
+	td.X, td.Y, td.HAlign, td.VAlign = 500, 450, types.AlignRight, types.AlignTop
 	td.MinHeight = 300
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 400)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 400)
 
-	pdf.SetLineWidth(p.Buf, 0)
-	pdf.SetStrokeColor(p.Buf, pdf.Black)
-	pdf.DrawLine(p.Buf, 100, 0, 100, 600)
-	pdf.DrawLine(p.Buf, 500, 0, 500, 600)
-	pdf.DrawLine(p.Buf, 110, 0, 110, 600)
-	pdf.DrawLine(p.Buf, 490, 0, 490, 600)
-	pdf.DrawLine(p.Buf, 0, 150, 600, 150)
-	pdf.DrawLine(p.Buf, 0, 450, 600, 450)
-	pdf.DrawLine(p.Buf, 0, 160, 600, 160)
-	pdf.DrawLine(p.Buf, 0, 440, 600, 440)
+	draw.SetLineWidth(p.Buf, 0)
+	draw.SetStrokeColor(p.Buf, color.Black)
+	draw.DrawLineSimple(p.Buf, 100, 0, 100, 600)
+	draw.DrawLineSimple(p.Buf, 500, 0, 500, 600)
+	draw.DrawLineSimple(p.Buf, 110, 0, 110, 600)
+	draw.DrawLineSimple(p.Buf, 490, 0, 490, 600)
+	draw.DrawLineSimple(p.Buf, 0, 150, 600, 150)
+	draw.DrawLineSimple(p.Buf, 0, 450, 600, 450)
+	draw.DrawLineSimple(p.Buf, 0, 160, 600, 160)
+	draw.DrawLineSimple(p.Buf, 0, 440, 600, 440)
 	//pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
 	return p
 }
 
-func createTextBorderNoMarginAlignCenterTest(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPageWithBg(mediaBox, pdf.NewSimpleColor(0xbeded9))
+func createTextBorderNoMarginAlignCenterTest(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPageWithBg(mediaBox, color.NewSimpleColor(0xbeded9))
 	fontName := "Times-Roman"
 	k := p.Fm.EnsureKey(fontName)
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText2,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
+		RMode:          draw.RMFill,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: .6, G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: .6, G: .98, B: .77},
 		ShowBorder:     true,
 		BorderWidth:    10,
-		BorderCol:      pdf.NewSimpleColor(0xabe003),
+		BorderCol:      color.NewSimpleColor(0xabe003),
 		ShowMargins:    true,
 		MLeft:          10,
 		MRight:         10,
@@ -1580,41 +1662,41 @@ func createTextBorderNoMarginAlignCenterTest(mediaBox *pdf.Rectangle) pdf.Page {
 		ShowTextBB:     true,
 	}
 
-	td.X, td.Y, td.HAlign, td.VAlign = 300, 450, pdf.AlignCenter, pdf.AlignTop
+	td.X, td.Y, td.HAlign, td.VAlign = 300, 450, types.AlignCenter, types.AlignTop
 	td.MinHeight = 300
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 400)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 400)
 
-	pdf.SetLineWidth(p.Buf, 0)
-	pdf.SetStrokeColor(p.Buf, pdf.Black)
-	pdf.DrawLine(p.Buf, 100, 0, 100, 600)
-	pdf.DrawLine(p.Buf, 500, 0, 500, 600)
-	pdf.DrawLine(p.Buf, 110, 0, 110, 600)
-	pdf.DrawLine(p.Buf, 490, 0, 490, 600)
-	pdf.DrawLine(p.Buf, 0, 150, 600, 150)
-	pdf.DrawLine(p.Buf, 0, 450, 600, 450)
-	pdf.DrawLine(p.Buf, 0, 160, 600, 160)
-	pdf.DrawLine(p.Buf, 0, 440, 600, 440)
+	draw.SetLineWidth(p.Buf, 0)
+	draw.SetStrokeColor(p.Buf, color.Black)
+	draw.DrawLineSimple(p.Buf, 100, 0, 100, 600)
+	draw.DrawLineSimple(p.Buf, 500, 0, 500, 600)
+	draw.DrawLineSimple(p.Buf, 110, 0, 110, 600)
+	draw.DrawLineSimple(p.Buf, 490, 0, 490, 600)
+	draw.DrawLineSimple(p.Buf, 0, 150, 600, 150)
+	draw.DrawLineSimple(p.Buf, 0, 450, 600, 450)
+	draw.DrawLineSimple(p.Buf, 0, 440, 600, 440)
 	//pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
 	return p
 }
 
-func createTextBorderNoMarginAlignJustifyTest(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPageWithBg(mediaBox, pdf.NewSimpleColor(0xbeded9))
+func createTextBorderNoMarginAlignJustifyTest(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPageWithBg(mediaBox, color.NewSimpleColor(0xbeded9))
 	fontName := "Times-Roman"
 	k := p.Fm.EnsureKey(fontName)
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText2,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		Scale:          1.,
 		ScaleAbs:       true,
-		RMode:          pdf.RMFill,
+		RMode:          draw.RMFill,
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: .6, G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: .6, G: .98, B: .77},
 		ShowBorder:     true,
 		BorderWidth:    10,
-		BorderCol:      pdf.NewSimpleColor(0xabe003),
+		BorderCol:      color.NewSimpleColor(0xabe003),
 		ShowTextBB:     true,
 		ShowMargins:    true,
 		MLeft:          10,
@@ -1623,70 +1705,114 @@ func createTextBorderNoMarginAlignJustifyTest(mediaBox *pdf.Rectangle) pdf.Page 
 		MBot:           10,
 	}
 
-	td.X, td.Y, td.HAlign, td.VAlign = 100, 450, pdf.AlignJustify, pdf.AlignTop
+	td.X, td.Y, td.HAlign, td.VAlign = 100, 450, types.AlignJustify, types.AlignTop
 	td.MinHeight = 300
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 400)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 400)
 
-	pdf.SetLineWidth(p.Buf, 0)
-	pdf.SetStrokeColor(p.Buf, pdf.Black)
-	pdf.DrawLine(p.Buf, 100, 0, 100, 600)
-	pdf.DrawLine(p.Buf, 500, 0, 500, 600)
-	pdf.DrawLine(p.Buf, 110, 0, 110, 600)
-	pdf.DrawLine(p.Buf, 490, 0, 490, 600)
-	pdf.DrawLine(p.Buf, 0, 150, 600, 150)
-	pdf.DrawLine(p.Buf, 0, 450, 600, 450)
-	pdf.DrawLine(p.Buf, 0, 160, 600, 160)
-	pdf.DrawLine(p.Buf, 0, 440, 600, 440)
+	draw.SetLineWidth(p.Buf, 0)
+	draw.SetStrokeColor(p.Buf, color.Black)
+	draw.DrawLineSimple(p.Buf, 100, 0, 100, 600)
+	draw.DrawLineSimple(p.Buf, 500, 0, 500, 600)
+	draw.DrawLineSimple(p.Buf, 110, 0, 110, 600)
+	draw.DrawLineSimple(p.Buf, 490, 0, 490, 600)
+	draw.DrawLineSimple(p.Buf, 0, 150, 600, 150)
+	draw.DrawLineSimple(p.Buf, 0, 450, 600, 450)
+	draw.DrawLineSimple(p.Buf, 0, 160, 600, 160)
+	draw.DrawLineSimple(p.Buf, 0, 440, 600, 440)
 	//pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
 	return p
 }
 
-func createXRefAndWritePDF(t *testing.T, msg, fileName string, p pdf.Page) {
+func createXRefAndWritePDF(t *testing.T, msg, fileName string, mediaBox *types.Rectangle, f func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page) {
 	t.Helper()
-	xRefTable, err := pdf.CreateDemoXRef(p)
+	xRefTable, err := pdfcpu.CreateXRefTableWithRootDict()
 	if err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
-	outDir := filepath.Join("..", "..", "samples", "create")
+
+	p := f(xRefTable, mediaBox)
+
+	rootDict, err := xRefTable.Catalog()
+	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	if err = addPageTreeWithPage(t.Context(), xRefTable, rootDict, p); err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+
+	outDir := filepath.Join("..", "..", "samples", "basic")
 	outFile := filepath.Join(outDir, fileName+".pdf")
 	createAndValidate(t, xRefTable, outFile, msg)
 }
 
-func testTextDemoPDF(t *testing.T, msg, fileName string, w, h int, hAlign pdf.HAlignment) {
+func testTextDemoPDF(t *testing.T, msg, fileName string, w, h int, hAlign types.HAlignment) {
 	t.Helper()
 
-	var f1, f2, f3, f4 func(mediaBox *pdf.Rectangle) pdf.Page
+	var f1, f2, f3, f4 func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page
 
 	switch hAlign {
-	case pdf.AlignLeft:
-		f1 = createTextDemoAlignLeft
-		f2 = createTextDemoAlignLeftMargin
-		f3 = createTextDemoAlignLeftWidth
-		f4 = createTextDemoAlignLeftWidthAndMargin
-	case pdf.AlignCenter:
-		f1 = createTextDemoAlignCenter
-		f2 = createTextDemoAlignCenterMargin
-		f3 = createTextDemoAlignCenterWidth
-		f4 = createTextDemoAlignCenterWidthAndMargin
-	case pdf.AlignRight:
-		f1 = createTextDemoAlignRight
-		f2 = createTextDemoAlignRightMargin
-		f3 = createTextDemoAlignRightWidth
-		f4 = createTextDemoAlignRightWidthAndMargin
-	case pdf.AlignJustify:
-		f1 = createTextDemoAlignJustify
-		f2 = createTextDemoAlignJustifyMargin
-		f3 = createTextDemoAlignJustifyWidth
-		f4 = createTextDemoAlignJustifyWidthAndMargin
+	case types.AlignLeft:
+		f1 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignLeft(t.Context(), xRefTable, mediaBox)
+		}
+		f2 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignLeftMargin(t.Context(), xRefTable, mediaBox)
+		}
+		f3 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignLeftWidth(t.Context(), xRefTable, mediaBox)
+		}
+		f4 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignLeftWidthAndMargin(t.Context(), xRefTable, mediaBox)
+		}
+	case types.AlignCenter:
+		f1 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignCenter(t.Context(), xRefTable, mediaBox)
+		}
+		f2 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignCenterMargin(t.Context(), xRefTable, mediaBox)
+		}
+		f3 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignCenterWidth(t.Context(), xRefTable, mediaBox)
+		}
+		f4 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignCenterWidthAndMargin(t.Context(), xRefTable, mediaBox)
+		}
+	case types.AlignRight:
+		f1 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignRight(t.Context(), xRefTable, mediaBox)
+		}
+		f2 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignRightMargin(t.Context(), xRefTable, mediaBox)
+		}
+		f3 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignRightWidth(t.Context(), xRefTable, mediaBox)
+		}
+		f4 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignRightWidthAndMargin(t.Context(), xRefTable, mediaBox)
+		}
+	case types.AlignJustify:
+		f1 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignJustify(t.Context(), xRefTable, mediaBox)
+		}
+		f2 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignJustifyMargin(t.Context(), xRefTable, mediaBox)
+		}
+		f3 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignJustifyWidth(t.Context(), xRefTable, mediaBox)
+		}
+		f4 = func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAlignJustifyWidthAndMargin(t.Context(), xRefTable, mediaBox)
+		}
 	}
 
-	mediaBox := pdf.RectForDim(float64(w), float64(h))
-	createXRefAndWritePDF(t, msg, "TextDemo"+fileName, f1(mediaBox))
-	createXRefAndWritePDF(t, msg, "TextDemo"+fileName+"Margin", f2(mediaBox))
-	createXRefAndWritePDF(t, msg, "TextDemo"+fileName+"Width", f3(mediaBox))
-	createXRefAndWritePDF(t, msg, "TextDemo"+fileName+"WidthAndMargin", f4(mediaBox))
+	mediaBox := types.RectForDim(float64(w), float64(h))
+	createXRefAndWritePDF(t, msg, "TextDemo"+fileName, mediaBox, f1)
+	createXRefAndWritePDF(t, msg, "TextDemo"+fileName+"Margin", mediaBox, f2)
+	createXRefAndWritePDF(t, msg, "TextDemo"+fileName+"Width", mediaBox, f3)
+	createXRefAndWritePDF(t, msg, "TextDemo"+fileName+"WidthAndMargin", mediaBox, f4)
 }
 
+// TestTextDemoPDF verifies text demo PDF.
 func TestTextDemoPDF(t *testing.T) {
 	msg := "TestTextDemoPDF"
 	w, h := 600, 600
@@ -1694,50 +1820,87 @@ func TestTextDemoPDF(t *testing.T) {
 	for _, tt := range []struct {
 		fileName string
 		w, h     int
-		hAlign   pdf.HAlignment
+		hAlign   types.HAlignment
 	}{
-		{"AlignLeft", w, h, pdf.AlignLeft},
-		{"AlignCenter", w, h, pdf.AlignCenter},
-		{"AlignRight", w, h, pdf.AlignRight},
-		{"AlignJustify", w, h, pdf.AlignJustify},
+		{"AlignLeft", w, h, types.AlignLeft},
+		{"AlignCenter", w, h, types.AlignCenter},
+		{"AlignRight", w, h, types.AlignRight},
+		{"AlignJustify", w, h, types.AlignJustify},
 	} {
 		testTextDemoPDF(t, msg, tt.fileName, tt.w, tt.h, tt.hAlign)
 	}
 }
 
+// TestColumnDemoPDF verifies column demo PDF.
 func TestColumnDemoPDF(t *testing.T) {
 	msg := "TestColumnDemoPDF"
 
 	for _, tt := range []struct {
 		fileName string
 		w, h     int
-		f        func(mediaBox *pdf.Rectangle) pdf.Page
+		f        func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page
 	}{
-		{"TestTextAlignJustifyDemo", 600, 600, createTextAlignJustifyDemo},
-		{"TestTextAlignJustifyColumnDemo", 600, 600, createTextAlignJustifyColumnDemo},
-		{"TextDemoAnchors", 600, 600, createTextDemoAnchors},
-		{"TextDemoAnchorsWithOffset", 600, 600, createTextDemoAnchorsWithOffset},
-		{"TextDemoColumnAnchored", 1200, 1200, createTextDemoColumnAnchored},
-		{"TextDemoColumnAnchoredWithOffset", 1200, 1200, createTextDemoColumnAnchoredWithOffset},
-		{"TextRotateDemo", 1200, 1200, createTextRotateDemo},
-		{"TextRotateDemoWithOffset", 1200, 1200, createTextRotateDemoWithOffset},
-		{"TextScaleAbsoluteDemo", 600, 600, createTextScaleAbsoluteDemo},
-		{"TextScaleAbsoluteDemoWithOffset", 600, 600, createTextScaleAbsoluteDemoWithOffset},
-		{"TextScaleRelativeDemo", 600, 600, createTextScaleRelativeDemo},
-		{"TextScaleRelativeDemoWithOffset", 600, 600, createTextScaleRelativeDemoWithOffset},
-		{"TextDemoColumns", 600, 600, createTextDemoColumns},
-		{"TextBorderTest", 600, 600, createTextBorderTest},
-		{"TextBorderNoMarginAlignLeftTest", 600, 600, createTextBorderNoMarginAlignLeftTest},
-		{"TextBorderNoMarginAlignRightTest", 600, 600, createTextBorderNoMarginAlignRightTest},
-		{"TextBorderNoMarginAlignCenterTest", 600, 600, createTextBorderNoMarginAlignCenterTest},
-		{"TextBorderNoMarginAlignJustifyTest", 600, 600, createTextBorderNoMarginAlignJustifyTest},
+		{"TestTextAlignJustifyDemo", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextAlignJustifyDemo(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TestTextAlignJustifyColumnDemo", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextAlignJustifyColumnDemo(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextDemoAnchors", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAnchors(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextDemoAnchorsWithOffset", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoAnchorsWithOffset(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextDemoColumnAnchored", 1200, 1200, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoColumnAnchored(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextDemoColumnAnchoredWithOffset", 1200, 1200, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoColumnAnchoredWithOffset(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextRotateDemo", 1200, 1200, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextRotateDemo(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextRotateDemoWithOffset", 1200, 1200, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextRotateDemoWithOffset(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextScaleAbsoluteDemo", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextScaleAbsoluteDemo(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextScaleAbsoluteDemoWithOffset", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextScaleAbsoluteDemoWithOffset(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextScaleRelativeDemo", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextScaleRelativeDemo(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextScaleRelativeDemoWithOffset", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextScaleRelativeDemoWithOffset(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextDemoColumns", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextDemoColumns(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextBorderTest", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextBorderTest(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextBorderNoMarginAlignLeftTest", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextBorderNoMarginAlignLeftTest(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextBorderNoMarginAlignRightTest", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextBorderNoMarginAlignRightTest(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextBorderNoMarginAlignCenterTest", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextBorderNoMarginAlignCenterTest(t.Context(), xRefTable, mediaBox)
+		}},
+		{"TextBorderNoMarginAlignJustifyTest", 600, 600, func(xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+			return createTextBorderNoMarginAlignJustifyTest(t.Context(), xRefTable, mediaBox)
+		}},
 	} {
-		mediaBox := pdf.RectForDim(float64(tt.w), float64(tt.h))
-		createXRefAndWritePDF(t, msg, tt.fileName, tt.f(mediaBox))
+		mediaBox := types.RectForDim(float64(tt.w), float64(tt.h))
+		createXRefAndWritePDF(t, msg, tt.fileName, mediaBox, tt.f)
 	}
 }
 
-func writecreateTestRTLUserFont(p pdf.Page, region *pdf.Rectangle, fontName, text string) {
+func writecreateTestRTLUserFont(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, fontName, s string) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -1751,14 +1914,15 @@ func writecreateTestRTLUserFont(p pdf.Page, region *pdf.Rectangle, fontName, tex
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
-		Text:           text,
+	td := model.TextDescriptor{
+		Text:           s,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		RTL:            true,
@@ -1770,35 +1934,35 @@ func writecreateTestRTLUserFont(p pdf.Page, region *pdf.Rectangle, fontName, tex
 		Y:              -1,
 		Scale:          1.,
 		ScaleAbs:       true,
-		HAlign:         pdf.AlignRight,
-		VAlign:         pdf.AlignMiddle,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.NewSimpleColor(0x206A29),
-		FillCol:        pdf.NewSimpleColor(0x206A29),
+		HAlign:         types.AlignRight,
+		VAlign:         types.AlignMiddle,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.NewSimpleColor(0x206A29),
+		FillCol:        color.NewSimpleColor(0x206A29),
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
 		HairCross:      false,
 	}
 
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
 
-	pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
+	draw.DrawHairCross(p.Buf, 0, 0, mediaBox)
 }
 
-func createTestRTLUserFont(mediaBox *pdf.Rectangle, language, fontName string) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
+func createTestRTLUserFont(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle, language, fontName string) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
 	text := sampleTextRTL[language]
-	writecreateTestRTLUserFont(p, region, fontName, text)
-	region = pdf.RectForWidthAndHeight(10, 10, mediaBox.Width()/4, mediaBox.Height()/4)
-	writecreateTestRTLUserFont(p, region, fontName, text)
+	writecreateTestRTLUserFont(c, xRefTable, p, region, fontName, text)
+	region = types.RectForWidthAndHeight(10, 10, mediaBox.Width()/4, mediaBox.Height()/4)
+	writecreateTestRTLUserFont(c, xRefTable, p, region, fontName, text)
 	return p
 }
 
-func writecreateTestUserFontJustified(p pdf.Page, region *pdf.Rectangle, rtl bool) {
+func writecreateTestUserFontJustified(c context.Context, xRefTable *model.XRefTable, p model.Page, region *types.Rectangle, rtl bool) {
 	mediaBox := p.MediaBox
 	buf := p.Buf
 
@@ -1812,15 +1976,16 @@ func writecreateTestUserFontJustified(p pdf.Page, region *pdf.Rectangle, rtl boo
 		cr, cg, cb = .75, .75, 1
 	}
 	if mediaBB {
-		pdf.FillRect(buf, r, pdf.SimpleColor{R: cr, G: cg, B: cb})
+		draw.FillRectNoBorder(buf, r, color.SimpleColor{R: cr, G: cg, B: cb})
 	}
 
 	fontName := "Roboto-Regular"
 	k := p.Fm.EnsureKey(fontName)
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		Text:           sampleText,
 		FontName:       fontName,
+		Embed:          true,
 		FontKey:        k,
 		FontSize:       12,
 		RTL:            rtl,
@@ -1832,53 +1997,107 @@ func writecreateTestUserFontJustified(p pdf.Page, region *pdf.Rectangle, rtl boo
 		Y:              -1,
 		Scale:          1.,
 		ScaleAbs:       true,
-		HAlign:         pdf.AlignJustify,
-		VAlign:         pdf.AlignMiddle,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.NewSimpleColor(0x206A29),
-		FillCol:        pdf.NewSimpleColor(0x206A29),
+		HAlign:         types.AlignJustify,
+		VAlign:         types.AlignMiddle,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.NewSimpleColor(0x206A29),
+		FillCol:        color.NewSimpleColor(0x206A29),
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
 		HairCross:      false,
 	}
 
-	pdf.WriteMultiLine(buf, mediaBox, region, td)
+	model.WriteMultiLine(c, xRefTable, buf, mediaBox, region, td)
 
-	pdf.DrawHairCross(p.Buf, 0, 0, mediaBox)
+	draw.DrawHairCross(p.Buf, 0, 0, mediaBox)
 }
 
-func createTestUserFontJustified(mediaBox *pdf.Rectangle, rtl bool) pdf.Page {
-	p := pdf.NewPage(mediaBox)
-	var region *pdf.Rectangle
-	writecreateTestUserFontJustified(p, region, rtl)
+func createTestUserFontJustified(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle, rtl bool) model.Page {
+	p := model.NewPage(mediaBox, nil)
+	var region *types.Rectangle
+	writecreateTestUserFontJustified(c, xRefTable, p, region, rtl)
 	return p
 }
 
-func TestUserFontJustified(t *testing.T) {
-	msg := "TestUserFontJustified"
-
-	// Install test user fonts (in addition to already installed user fonts)
-	// from pkg/testdata/fonts.
-	api.LoadConfiguration()
-	if err := api.InstallFonts(userFonts(t, filepath.Join("..", "..", "testdata", "fonts"))); err != nil {
+func createXRefAndWriteJustifiedPDF(t *testing.T, msg, fileName string, mediaBox *types.Rectangle, rtl bool) {
+	t.Helper()
+	xRefTable, err := pdfcpu.CreateXRefTableWithRootDict()
+	if err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 
-	mediaBox := pdf.RectForDim(600, 600)
-	createXRefAndWritePDF(t, msg, "UserFont_Justified", createTestUserFontJustified(mediaBox, false))
-	createXRefAndWritePDF(t, msg, "UserFont_JustifiedRightToLeft", createTestUserFontJustified(mediaBox, true))
-	// Justified text for right to left languages seems to be tricky business - the following samples are right aligned:
-	createXRefAndWritePDF(t, msg, "UserFont_Arabic", createTestRTLUserFont(mediaBox, "Arabic", "UnifontMedium"))
-	createXRefAndWritePDF(t, msg, "UserFont_Hebrew", createTestRTLUserFont(mediaBox, "Hebrew", "UnifontMedium"))
-	createXRefAndWritePDF(t, msg, "UserFont_Persian", createTestRTLUserFont(mediaBox, "Persian", "UnifontMedium"))
-	createXRefAndWritePDF(t, msg, "UserFont_Urdu", createTestRTLUserFont(mediaBox, "Urdu", "UnifontMedium"))
+	p := createTestUserFontJustified(t.Context(), xRefTable, mediaBox, rtl)
+
+	rootDict, err := xRefTable.Catalog()
+	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	if err = addPageTreeWithPage(t.Context(), xRefTable, rootDict, p); err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+
+	outDir := filepath.Join("..", "..", "samples", "basic")
+	outFile := filepath.Join(outDir, fileName+".pdf")
+	createAndValidate(t, xRefTable, outFile, msg)
 }
 
-func createCJKVDemo(mediaBox *pdf.Rectangle) pdf.Page {
-	p := pdf.NewPage(mediaBox)
+// TestUserFontJustified verifies user font justified.
+func TestUserFontJustified(t *testing.T) {
+	msg := "TestUserFontJustified"
+	mediaBox := types.RectForDim(600, 600)
+	createXRefAndWriteJustifiedPDF(t, msg, "UserFont_Justified", mediaBox, false)
+	createXRefAndWriteJustifiedPDF(t, msg, "UserFont_JustifiedRightToLeft", mediaBox, true)
+}
+
+func createXRefAndWriteRTLPDF(t *testing.T, msg, fileName string, mediaBox *types.Rectangle, language, fontName string, f func(xRefTable *model.XRefTable, mediaBox *types.Rectangle, language, fontName string) model.Page) {
+	t.Helper()
+
+	xRefTable, err := pdfcpu.CreateXRefTableWithRootDict()
+	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+
+	p := f(xRefTable, mediaBox, language, fontName)
+
+	rootDict, err := xRefTable.Catalog()
+	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	if err = addPageTreeWithPage(t.Context(), xRefTable, rootDict, p); err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	outDir := filepath.Join("..", "..", "samples", "basic")
+	outFile := filepath.Join(outDir, fileName+".pdf")
+	createAndValidate(t, xRefTable, outFile, msg)
+}
+
+// TestUserFontRTL verifies user font rtl.
+func TestUserFontRTL(t *testing.T) {
+	msg := "TestUserFontRTL"
+	f := func(xRefTable *model.XRefTable, mediaBox *types.Rectangle, language, fontName string) model.Page {
+		return createTestRTLUserFont(t.Context(), xRefTable, mediaBox, language, fontName)
+	}
+	mediaBox := types.RectForDim(600, 600)
+
+	for _, tt := range []struct {
+		fileName string
+		language string
+		fontName string
+	}{
+		{"UserFont_Arabic", "Arabic", "UnifontMedium"},
+		{"UserFont_Hebrew", "Hebrew", "UnifontMedium"},
+		{"UserFont_Persian", "Persian", "UnifontMedium"},
+		{"UserFont_Urdu", "Urdu", "UnifontMedium"},
+	} {
+		createXRefAndWriteRTLPDF(t, msg, tt.fileName, mediaBox, tt.language, tt.fontName, f)
+	}
+}
+
+func createCJKVDemo(c context.Context, xRefTable *model.XRefTable, mediaBox *types.Rectangle) model.Page {
+	p := model.NewPage(mediaBox, nil)
 	mb := p.MediaBox
 
 	textEnglish := `pdfcpu
@@ -1901,21 +2120,22 @@ CJKVフォントがサポートされるようになりました！`
 Xử lý PDF tức thì cho mọi nhu cầu của bạn.
 Bây giờ với sự hỗ trợ cho các phông chữ CJKV!`
 
-	td := pdf.TextDescriptor{
+	td := model.TextDescriptor{
 		FontSize:       24,
+		Embed:          true,
 		MLeft:          5,
 		MRight:         5,
 		MTop:           5,
 		MBot:           5,
 		Scale:          1,
 		ScaleAbs:       true,
-		HAlign:         pdf.AlignLeft,
-		VAlign:         pdf.AlignMiddle,
-		RMode:          pdf.RMFill,
-		StrokeCol:      pdf.NewSimpleColor(0x206A29),
-		FillCol:        pdf.NewSimpleColor(0x206A29),
+		HAlign:         types.AlignLeft,
+		VAlign:         types.AlignMiddle,
+		RMode:          draw.RMFill,
+		StrokeCol:      color.NewSimpleColor(0x206A29),
+		FillCol:        color.NewSimpleColor(0x206A29),
 		ShowBackground: true,
-		BackgroundCol:  pdf.SimpleColor{R: 1., G: .98, B: .77},
+		BackgroundCol:  color.SimpleColor{R: 1., G: .98, B: .77},
 		ShowBorder:     true,
 		ShowLineBB:     false,
 		ShowTextBB:     true,
@@ -1924,50 +2144,59 @@ Bây giờ với sự hỗ trợ cho các phông chữ CJKV!`
 
 	td.Text, td.FontName, td.FontKey = textChineseSimple, "UnifontMedium", p.Fm.EnsureKey("UnifontMedium")
 	td.X, td.Y = 0, mb.Height()
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
 
 	td.Text, td.FontName, td.FontKey = textJapanese, "Unifont-JPMedium", p.Fm.EnsureKey("Unifont-JPMedium")
 	td.X, td.Y = mb.Width(), 2*mb.Height()/3
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
 
 	td.Text, td.FontName, td.FontKey = textKorean, "UnifontMedium", p.Fm.EnsureKey("UnifontMedium")
 	td.X, td.Y = 0, mb.Height()/3
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
 
 	td.Text, td.FontName, td.FontKey = textVietnamese, "Roboto-Regular", p.Fm.EnsureKey("Roboto-Regular")
 	td.X, td.Y = mb.Width(), 0
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 3*mb.Width()/4)
 
 	td.Text, td.FontSize, td.ShowTextBB = textEnglish, 24, false
-	td.X, td.Y, td.HAlign = -1, -1, pdf.AlignCenter
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 0)
+	td.X, td.Y, td.HAlign = -1, -1, types.AlignCenter
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 0)
 
 	td.FontSize = 80
-	td.Text, td.HAlign, td.X, td.Y = "C", pdf.AlignRight, mb.Width(), mb.Height()
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 0)
+	td.Text, td.HAlign, td.X, td.Y = "C", types.AlignRight, mb.Width(), mb.Height()
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 0)
 
-	td.Text, td.HAlign, td.X, td.Y = "J", pdf.AlignLeft, 0, 2*mb.Height()/3
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 0)
+	td.Text, td.HAlign, td.X, td.Y = "J", types.AlignLeft, 0, 2*mb.Height()/3
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 0)
 
-	td.Text, td.HAlign, td.X, td.Y = "K", pdf.AlignRight, mb.Width(), mb.Height()/3
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 0)
+	td.Text, td.HAlign, td.X, td.Y = "K", types.AlignRight, mb.Width(), mb.Height()/3
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 0)
 
-	td.Text, td.HAlign, td.X, td.Y = "V", pdf.AlignLeft, 0, 0
-	pdf.WriteColumn(p.Buf, mediaBox, nil, td, 0)
+	td.Text, td.HAlign, td.X, td.Y = "V", types.AlignLeft, 0, 0
+	model.WriteColumn(c, xRefTable, p.Buf, mediaBox, nil, td, 0)
 
 	return p
 }
 
+// TestCJKV verifies CJKV.
 func TestCJKV(t *testing.T) {
 	msg := "TestCJKV"
-
-	// Install test user fonts (in addition to already installed user fonts)
-	// from pkg/testdata/fonts.
-	api.LoadConfiguration()
-	if err := api.InstallFonts(userFonts(t, filepath.Join("..", "..", "testdata", "fonts"))); err != nil {
+	mediaBox := types.RectForDim(600, 600)
+	xRefTable, err := pdfcpu.CreateXRefTableWithRootDict()
+	if err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 
-	mediaBox := pdf.RectForDim(600, 600)
-	createXRefAndWritePDF(t, msg, "UserFont_CJKV", createCJKVDemo(mediaBox))
+	p := createCJKVDemo(t.Context(), xRefTable, mediaBox)
+
+	rootDict, err := xRefTable.Catalog()
+	if err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	if err = addPageTreeWithPage(t.Context(), xRefTable, rootDict, p); err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+	outDir := filepath.Join("..", "..", "samples", "basic")
+	outFile := filepath.Join(outDir, "UserFont_CJKV.pdf")
+	createAndValidate(t, xRefTable, outFile, msg)
 }

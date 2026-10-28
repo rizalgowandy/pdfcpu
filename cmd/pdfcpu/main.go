@@ -18,49 +18,93 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
-)
+	"os/signal"
+	"runtime/debug"
+	"syscall"
 
-var (
-	fileStats, mode, selectedPages  string
-	upw, opw, key, perm, unit, conf string
-	verbose, veryVerbose            bool
-	links, quiet, sorted            bool
-	needStackTrace                  = true
-	cmdMap                          commandMap
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/fault"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 // Set by Goreleaser.
 var (
-	commit = "?"
-	date   = "?"
+	version = model.VersionStr
+	commit  = "?"
+	date    = "?"
 )
 
 func init() {
-	initFlags()
-	initCommandMap()
+	updateVersionInfoFromBuildInfo()
+}
+
+func updateVersionInfoFromBuildInfo() {
+	if commit != "?" && date != "?" {
+		return
+	}
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	setVersionInfoFromBuildSettings(info.Settings)
+}
+
+func setVersionInfoFromBuildSettings(settings []debug.BuildSetting) {
+	for _, setting := range settings {
+		switch setting.Key {
+		case "vcs.revision":
+			if commit == "?" {
+				commit = shortCommit(setting.Value)
+			}
+		case "vcs.time":
+			if date == "?" {
+				date = setting.Value
+			}
+		}
+	}
+}
+
+func shortCommit(s string) string {
+	if len(s) < 8 {
+		return s
+	}
+	return s[:8]
+}
+
+func printError(err error) {
+	if !needStackTrace {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Fatal: %v\n", err)
+	var p fault.Panic
+	if errors.As(err, &p) && len(p.Stack) > 0 {
+		fmt.Fprintf(os.Stderr, "\nStack Trace:\n%s", p.Stack)
+	}
+}
+
+func commandContext() (context.Context, context.CancelFunc) {
+	c, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go restoreDefaultSignalHandling(c, stop)
+	return c, stop
+}
+
+func restoreDefaultSignalHandling(c context.Context, stop context.CancelFunc) {
+	<-c.Done()
+	stop()
 }
 
 func main() {
-	if len(os.Args) == 1 {
-		fmt.Fprintln(os.Stderr, usage)
-		os.Exit(0)
-	}
+	c, stop := commandContext()
+	defer stop()
 
-	// The first argument is the pdfcpu command string.
-	cmdStr := os.Args[1]
-
-	// Process command string for given configuration.
-	str, err := cmdMap.process(cmdStr, "")
-	if err != nil {
-		if len(str) > 0 {
-			cmdStr = fmt.Sprintf("%s %s", str, os.Args[2])
-		}
-		fmt.Fprintf(os.Stderr, "%v \"%s\"\n", err, cmdStr)
-		fmt.Fprintln(os.Stderr, "Run 'pdfcpu help' for usage.")
+	if err := execute(c); err != nil {
+		printError(err)
 		os.Exit(1)
 	}
-
-	os.Exit(0)
 }

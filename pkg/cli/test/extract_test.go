@@ -23,76 +23,81 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/cli"
 )
 
+// TestExtractImagesCommand verifies extract images command.
 func TestExtractImagesCommand(t *testing.T) {
 	msg := "TestExtractImagesCommand"
 
 	// Extract all images for each PDF file into outDir.
-	cmd := cli.ExtractImagesCommand("", outDir, nil, nil)
+	cmd := cli.ExtractImagesCommand("", outDir, nil, conf)
 	//for _, f := range allPDFs(t, inDir) {
 	for _, f := range []string{"5116.DCT_Filter.pdf", "testImage.pdf", "go.pdf"} {
 		inFile := filepath.Join(inDir, f)
 		cmd.InFile = &inFile
 		// Extract all images.
-		if _, err := cli.Process(cmd); err != nil {
+		if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 			t.Fatalf("%s %s: %v\n", msg, inFile, err)
 		}
 	}
 
 	// Extract all images for inFile starting with page 1 into outDir.
 	inFile := filepath.Join(inDir, "testImage.pdf")
-	cmd = cli.ExtractImagesCommand(inFile, outDir, []string{"1-"}, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.ExtractImagesCommand(inFile, outDir, []string{"1-"}, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, inFile, err)
 	}
 }
 
+// TestExtractFontsCommand verifies extract fonts command.
 func TestExtractFontsCommand(t *testing.T) {
 	msg := "TestExtractFontsCommand"
 
 	// Extract fonts for all pages for the following 3 PDF files into outDir.
-	cmd := cli.ExtractFontsCommand("", outDir, nil, nil)
+	cmd := cli.ExtractFontsCommand("", outDir, nil, conf)
 	for _, fn := range []string{"5116.DCT_Filter.pdf", "testImage.pdf", "go.pdf"} {
 		fn = filepath.Join(inDir, fn)
 		cmd.InFile = &fn
-		if _, err := cli.Process(cmd); err != nil {
+		if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 			t.Fatalf("%s %s: %v\n", msg, fn, err)
 		}
 	}
 
 	// Extract fonts for pages 1-3 into outDir.
 	inFile := filepath.Join(inDir, "go.pdf")
-	cmd = cli.ExtractFontsCommand(inFile, outDir, []string{"1-3"}, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.ExtractFontsCommand(inFile, outDir, []string{"1-3"}, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, inFile, err)
 	}
 }
 
+// TestExtractPagesCommand verifies extract pages command.
 func TestExtractPagesCommand(t *testing.T) {
 	msg := "TestExtractPagesCommand"
 	// Extract page #1 into outDir.
 	inFile := filepath.Join(inDir, "TheGoProgrammingLanguageCh1.pdf")
-	cmd := cli.ExtractPagesCommand(inFile, outDir, []string{"1"}, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.ExtractPagesCommand(inFile, outDir, []string{"1"}, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, inFile, err)
 	}
 }
 
+// TestExtractContentCommand verifies extract content command.
 func TestExtractContentCommand(t *testing.T) {
 	msg := "TestExtractContentCommand"
 	// Extract content of all pages into outDir.
 	inFile := filepath.Join(inDir, "5116.DCT_Filter.pdf")
-	cmd := cli.ExtractContentCommand(inFile, outDir, nil, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.ExtractContentCommand(inFile, outDir, nil, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, inFile, err)
 	}
 }
 
+// TestExtractMetadataCommand verifies extract metadata command.
 func TestExtractMetadataCommand(t *testing.T) {
 	msg := "TestExtractMetadataCommand"
 	// Extract metadata into outDir.
 	inFile := filepath.Join(inDir, "TheGoProgrammingLanguageCh1.pdf")
-	cmd := cli.ExtractMetadataCommand(inFile, outDir, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.ExtractMetadataCommand(inFile, outDir, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, inFile, err)
 	}
 }

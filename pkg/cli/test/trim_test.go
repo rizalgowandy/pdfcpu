@@ -23,18 +23,18 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/cli"
 )
 
-// Trim test PDF file so that only the first two pages are rendered.
+// TestTrimCommand test PDF file so that only the first two pages are rendered.
 func TestTrimCommand(t *testing.T) {
 	msg := "TestTrimCommand"
 	inFile := filepath.Join(inDir, "pike-stanford.pdf")
 	outFile := filepath.Join(outDir, "test.pdf")
 
-	cmd := cli.TrimCommand(inFile, outFile, []string{"-2"}, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.TrimCommand(inFile, outFile, []string{"-2"}, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
-	if err := validateFile(t, outFile, nil); err != nil {
+	if err := validateFile(t, outFile, conf); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }

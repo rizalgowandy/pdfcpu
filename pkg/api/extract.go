@@ -17,6 +17,9 @@
 package api
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,368 +27,688 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/pdfcpu/pdfcpu/pkg/log"
+	"github.com/pdfcpu/pdfcpu/internal/contextutil"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
-	"github.com/pkg/errors"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/fault"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/sanitize"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
-// ExtractImagesRaw returns []pdfcpu.Image containing io.Readers for images contained in selectedPages.
-// Beware of memory intensive returned slice.
-func ExtractImagesRaw(rs io.ReadSeeker, selectedPages []string, conf *pdfcpu.Configuration) ([]pdfcpu.Image, error) {
-	if rs == nil {
-		return nil, errors.New("pdfcpu: ExtractImages: Please provide rs")
-	}
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
-	}
+// UnsupportedResourceError aggregates resources skipped during an otherwise
+// successful extraction.
+type UnsupportedResourceError struct {
+	// Err contains the contextual errors for all skipped resources.
+	Err error
+}
 
-	ctx, _, _, _, err := readValidateAndOptimize(rs, conf, time.Now())
-	if err != nil {
-		return nil, err
+// Error returns the aggregated unsupported-resource error text.
+func (e *UnsupportedResourceError) Error() string {
+	if e == nil || e.Err == nil {
+		return pdfcpu.ErrUnsupportedResource.Error()
 	}
+	return e.Err.Error()
+}
 
-	if err := ctx.EnsurePageCount(); err != nil {
-		return nil, err
+// Unwrap returns the aggregated unsupported-resource causes.
+func (e *UnsupportedResourceError) Unwrap() error {
+	if e == nil {
+		return nil
 	}
+	return e.Err
+}
 
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, true)
-	if err != nil {
-		return nil, err
+func unsupportedResourceError(err error) error {
+	if err == nil {
+		return nil
 	}
+	return &UnsupportedResourceError{Err: err}
+}
 
-	var images []pdfcpu.Image
-	for i, v := range pages {
-		if !v {
-			continue
+func skipUnsupportedResource(err error, conf *model.Configuration) bool {
+	return errors.Is(err, pdfcpu.ErrUnsupportedResource) &&
+		conf.UnsupportedResourcePolicy == model.UnsupportedResourceSkip
+}
+
+type extractionErrorWithoutSkipMarker struct {
+	message string
+	cause   error
+}
+
+func (e extractionErrorWithoutSkipMarker) Error() string {
+	return e.message
+}
+
+func (e extractionErrorWithoutSkipMarker) Unwrap() error {
+	return e.cause
+}
+
+func joinExtractionCleanupError(err, cleanupErr error) error {
+	if cleanupErr == nil {
+		return err
+	}
+	var unsupportedErr *UnsupportedResourceError
+	if errors.As(err, &unsupportedErr) {
+		cause := unsupportedErr.Err
+		if cause == nil {
+			cause = pdfcpu.ErrUnsupportedResource
 		}
-		ii, err := ctx.ExtractPageImages(i, false)
-		if err != nil {
+		err = extractionErrorWithoutSkipMarker{message: err.Error(), cause: cause}
+	}
+	return errors.Join(err, cleanupErr)
+}
+
+func digestImages(c context.Context, mm map[int]model.Image, singleImgPerPage bool, maxPageDigits int, digestImage func(model.Image, bool, int) error) (int, error) {
+	objNrs := make([]int, 0, len(mm))
+	for objNr := range mm {
+		if err := contextutil.Check(c); err != nil {
+			return 0, err
+		}
+		objNrs = append(objNrs, objNr)
+	}
+	sort.Ints(objNrs)
+	for _, objNr := range objNrs {
+		if err := contextutil.Check(c); err != nil {
+			return 0, err
+		}
+		img := mm[objNr]
+		if err := digestImage(img, singleImgPerPage, maxPageDigits); err != nil {
+			return img.ObjNr, err
+		}
+	}
+	return 0, contextutil.Check(c)
+}
+
+func sanitizeFilenamePart(s, fallback string) string {
+	return sanitize.PathOr(s, fallback)
+}
+
+// WriteImageToDisk returns a closure for writing an image transactionally to disk with cancellation.
+func WriteImageToDisk(c context.Context, outDir, fileName string) func(model.Image, bool, int) error {
+	fileName = sanitizeFilenamePart(fileName, "file")
+
+	return func(img model.Image, singleImgPerPage bool, maxPageDigits int) error {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		if img.Reader == nil {
+			return fmt.Errorf("image obj#%d: %w", img.ObjNr, ErrMissingImageReader)
+		}
+		s := "%s_%" + fmt.Sprintf("0%dd", maxPageDigits)
+		qual := img.Name
+		if img.Thumb {
+			qual = "thumb"
+		}
+		qual = sanitizeFilenamePart(qual, "image")
+		fileType := sanitizeFilenamePart(img.FileType, "img")
+		f := fmt.Sprintf(s+"_%s.%s", fileName, img.PageNr, qual, fileType)
+		outFile := filepath.Join(outDir, f)
+		if err := pdfcpu.WriteReader(c, outFile, img.Reader); err != nil {
+			if errors.Is(err, pdfcpu.ErrMissingReader) {
+				return fmt.Errorf("image obj#%d: %w", img.ObjNr, ErrMissingImageReader)
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+// WriteFontToDisk returns a closure for writing a font file transactionally to disk with cancellation.
+func WriteFontToDisk(c context.Context, outDir, fnBase string) func(pdfcpu.Font) error {
+	fnBase = sanitizeFilenamePart(fnBase, "file")
+
+	return func(font pdfcpu.Font) error {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		fontName := sanitizeFilenamePart(font.Name, "fontName")
+		fontType := sanitizeFilenamePart(font.Type, "fontType")
+		outFile := filepath.Join(outDir, fmt.Sprintf("%s_%s.%s", fnBase, fontName, fontType))
+		return pdfcpu.WriteReader(c, outFile, font.Reader)
+	}
+}
+
+// WritePageToDisk returns a closure for writing a single page PDF transactionally with cancellation.
+func WritePageToDisk(c context.Context, outDir, fnBase string) func(io.Reader, int) error {
+	fnBase = sanitizeFilenamePart(fnBase, "file")
+
+	return func(rd io.Reader, pageNr int) error {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		outFile := filepath.Join(outDir, fmt.Sprintf("%s_page_%d.pdf", fnBase, pageNr))
+		return pdfcpu.WriteReader(c, outFile, rd)
+	}
+}
+
+// WriteContentToDisk returns a closure for writing content transactionally to disk with cancellation.
+func WriteContentToDisk(c context.Context, outDir, fnBase string) func(io.Reader, int) error {
+	fnBase = sanitizeFilenamePart(fnBase, "file")
+
+	return func(rd io.Reader, pageNr int) error {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		outFile := filepath.Join(outDir, fmt.Sprintf("%s_Content_page_%d.txt", fnBase, pageNr))
+		return pdfcpu.WriteReader(c, outFile, rd)
+	}
+}
+
+// WriteMetadataToDisk returns a closure for writing metadata transactionally to disk with cancellation.
+func WriteMetadataToDisk(c context.Context, outDir, fnBase string) func(pdfcpu.Metadata) error {
+	fnBase = sanitizeFilenamePart(fnBase, "file")
+
+	return func(md pdfcpu.Metadata) error {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		parentType := sanitizeFilenamePart(md.ParentType, "metadata")
+		outFile := filepath.Join(outDir, fmt.Sprintf("%s_Metadata_%s_%d_%d.txt", fnBase, parentType, md.ParentObjNr, md.ObjNr))
+		return pdfcpu.WriteReader(c, outFile, md.Reader)
+	}
+}
+
+// ExtractImagesRaw returns image maps containing readers for images on selectedPages.
+// Note: may be memory intensive.
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError and images contains all successfully extracted images.
+// Extraction supports cancellation and may be memory intensive.
+func ExtractImagesRaw(c context.Context, rs io.ReadSeeker, selectedPages []string, conf *model.Configuration) (images []map[int]model.Image, err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return nil, err
+	}
+	if rs == nil {
+		return nil, ErrMissingPDFReadSeeker
+	}
+
+	conf = operationConfiguration(conf, model.EXTRACTIMAGES)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("extract images: %w", err)
+	}
+
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, true)
+	if err != nil {
+		return nil, fmt.Errorf("extract images: parse page selection: %w", err)
+	}
+
+	var skipErr error
+	for _, pageNr := range sortedPages(pages) {
+		if err := contextutil.Check(c); err != nil {
 			return nil, err
 		}
-		images = append(images, ii...)
+		mm, err := pdfcpu.ExtractPageImages(c, ctx, pageNr, false)
+		if err != nil {
+			if !skipUnsupportedResource(err, conf) {
+				return nil, fmt.Errorf("extract images: %w", err)
+			}
+			skipErr = errors.Join(skipErr, fmt.Errorf("extract images: %w", err))
+		}
+		images = append(images, mm)
 	}
 
-	return images, nil
+	return images, errors.Join(unsupportedResourceError(skipErr), contextutil.Check(c))
 }
 
 // ExtractImages extracts and digests embedded image resources from rs for selected pages.
-func ExtractImages(rs io.ReadSeeker, selectedPages []string, digestImage func(pdfcpu.Image, bool, int) error, conf *pdfcpu.Configuration) error {
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError after all supported images have been digested.
+// Extraction supports cancellation.
+func ExtractImages(c context.Context, rs io.ReadSeeker, selectedPages []string, digestImage func(model.Image, bool, int) error, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
 	if rs == nil {
-		return errors.New("pdfcpu: ExtractImages: Please provide rs")
+		return ErrMissingPDFReadSeeker
 	}
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
+	if digestImage == nil {
+		return fmt.Errorf("extract images: %w", ErrMissingDigestFunction)
 	}
 
-	ctx, _, _, _, err := readValidateAndOptimize(rs, conf, time.Now())
+	conf = operationConfiguration(conf, model.EXTRACTIMAGES)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("extract images: %w", err)
 	}
 
-	if err := ctx.EnsurePageCount(); err != nil {
-		return err
-	}
-
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, true)
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, true)
 	if err != nil {
-		return err
+		return fmt.Errorf("extract images: parse page selection: %w", err)
 	}
 
-	pageNrs := []int{}
-	for k, v := range pages {
-		if !v {
-			continue
-		}
-		pageNrs = append(pageNrs, k)
+	sp := sortedPages(pages)
+	if len(sp) == 0 {
+		return nil
 	}
 
-	sort.Ints(pageNrs)
-	maxPageDigits := len(strconv.Itoa(pageNrs[len(pageNrs)-1]))
+	maxPageDigits := len(strconv.Itoa(sp[len(sp)-1]))
 
-	for _, i := range pageNrs {
-		ii, err := ctx.ExtractPageImages(i, false)
-		if err != nil {
+	var skipErr error
+	for i := range sp {
+		if err := contextutil.Check(c); err != nil {
 			return err
 		}
-		singleImgPerPage := len(ii) == 1
-		for _, img := range ii {
-			if err := digestImage(img, singleImgPerPage, maxPageDigits); err != nil {
-				return err
+		pageNr := sp[i]
+		mm, err := pdfcpu.ExtractPageImages(c, ctx, pageNr, false)
+		if err != nil {
+			if !skipUnsupportedResource(err, conf) {
+				return fmt.Errorf("extract images: %w", err)
 			}
+			skipErr = errors.Join(skipErr, fmt.Errorf("extract images: %w", err))
+		}
+		singleImgPerPage := len(mm) == 1
+		objNr, err := digestImages(c, mm, singleImgPerPage, maxPageDigits, digestImage)
+		if err != nil {
+			return fmt.Errorf("extract images: page %d image obj#%d: digest: %w", pageNr, objNr, err)
 		}
 	}
 
-	return nil
+	return errors.Join(unsupportedResourceError(skipErr), contextutil.Check(c))
 }
 
 // ExtractImagesFile dumps embedded image resources from inFile into outDir for selected pages.
-func ExtractImagesFile(inFile, outDir string, selectedPages []string, conf *pdfcpu.Configuration) error {
-	f, err := os.Open(inFile)
-	if err != nil {
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError after all supported images have been written.
+// Extraction supports cancellation.
+func ExtractImagesFile(c context.Context, inFile, outDir string, selectedPages []string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
 		return err
 	}
-	defer f.Close()
-	log.CLI.Printf("extracting images from %s into %s/ ...\n", inFile, outDir)
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+
+	f, err := os.Open(inFile)
+	if err != nil {
+		return fmt.Errorf("extract images: open input %s: %w", inFile, err)
+	}
+	defer func() {
+		err = joinExtractionCleanupError(err, closeFile(f, "extract images: close input"))
+	}()
+
 	fileName := strings.TrimSuffix(filepath.Base(inFile), ".pdf")
-	return ExtractImages(f, selectedPages, pdfcpu.WriteImageToDisk(outDir, fileName), conf)
-}
 
-// ExtractFonts dumps embedded fontfiles from rs into outDir for selected pages.
-func ExtractFonts(rs io.ReadSeeker, outDir, fileName string, selectedPages []string, conf *pdfcpu.Configuration) error {
-	if rs == nil {
-		return errors.New("pdfcpu: ExtractFonts: Please provide rs")
+	if err := ExtractImages(
+		c, f, selectedPages, WriteImageToDisk(c, outDir, fileName), conf,
+	); err != nil {
+		return fmt.Errorf("extract images %s: %w", inFile, err)
 	}
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
-	}
-
-	fromStart := time.Now()
-	ctx, durRead, durVal, durOpt, err := readValidateAndOptimize(rs, conf, fromStart)
-	if err != nil {
-		return err
-	}
-
-	if err := ctx.EnsurePageCount(); err != nil {
-		return err
-	}
-
-	fromWrite := time.Now()
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, true)
-	if err != nil {
-		return err
-	}
-
-	fileName = strings.TrimSuffix(filepath.Base(fileName), ".pdf")
-
-	for i, v := range pages {
-		if !v {
-			continue
-		}
-		ff, err := ctx.ExtractPageFonts(i)
-		if err != nil {
-			return err
-		}
-		for _, f := range ff {
-			outFile := filepath.Join(outDir, fmt.Sprintf("%s_%s.%s", fileName, f.Name, f.Type))
-			log.CLI.Printf("writing %s\n", outFile)
-			w, err := os.Create(outFile)
-			if err != nil {
-				return err
-			}
-			if _, err = io.Copy(w, f); err != nil {
-				return err
-			}
-			if err := w.Close(); err != nil {
-				return err
-			}
-		}
-	}
-
-	durWrite := time.Since(fromWrite).Seconds()
-	durTotal := time.Since(fromStart).Seconds()
-	log.Stats.Printf("XRefTable:\n%s\n", ctx)
-	pdfcpu.TimingStats("write fonts", durRead, durVal, durOpt, durWrite, durTotal)
 	return nil
 }
 
-// ExtractFontsFile dumps embedded fontfiles from inFile into outDir for selected pages.
-func ExtractFontsFile(inFile, outDir string, selectedPages []string, conf *pdfcpu.Configuration) error {
+func writeFonts(c context.Context, ff []pdfcpu.Font, digestFont func(pdfcpu.Font) error) error {
+	for _, f := range ff {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		if err := digestFont(f); err != nil {
+			return fmt.Errorf("font %q obj#%d: digest: %w", f.Name, f.ObjNr, err)
+		}
+	}
+	return contextutil.Check(c)
+}
+
+func extractPageFonts(c context.Context, ctx *model.Context, pageNr int, objNrs, skipped types.IntSet, digestFont func(pdfcpu.Font) error, conf *model.Configuration) (error, error) {
+	ff, err := pdfcpu.ExtractPageFonts(c, ctx, pageNr, objNrs, skipped)
+	if ctxErr := contextutil.Check(c); ctxErr != nil {
+		return nil, ctxErr
+	}
+	var skipErr error
+	if err != nil {
+		if !skipUnsupportedResource(err, conf) {
+			return nil, err
+		}
+		skipErr = fmt.Errorf("extract fonts: %w", err)
+	}
+	if err := writeFonts(c, ff, digestFont); err != nil {
+		return nil, fmt.Errorf("page %d: %w", pageNr, err)
+	}
+	return skipErr, nil
+}
+
+// ExtractFonts retrieves and digests embedded fontfiles from rs for selected pages.
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError after all supported fonts have been digested.
+// Extraction supports cancellation.
+func ExtractFonts(c context.Context, rs io.ReadSeeker, selectedPages []string, digestFont func(pdfcpu.Font) error, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+	if digestFont == nil {
+		return fmt.Errorf("extract fonts: %w", ErrMissingDigestFunction)
+	}
+
+	conf = operationConfiguration(conf, model.EXTRACTFONTS)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
+	if err != nil {
+		return fmt.Errorf("extract fonts: %w", err)
+	}
+
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, true)
+	if err != nil {
+		return fmt.Errorf("extract fonts: parse page selection: %w", err)
+	}
+
+	objNrs, skipped := types.IntSet{}, types.IntSet{}
+	var skipErr error
+
+	for _, pageNr := range sortedPages(pages) {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		pageSkipErr, err := extractPageFonts(c, ctx, pageNr, objNrs, skipped, digestFont, conf)
+		if err != nil {
+			return fmt.Errorf("extract fonts: %w", err)
+		}
+		skipErr = errors.Join(skipErr, pageSkipErr)
+	}
+
+	ff, err := pdfcpu.ExtractFormFonts(c, ctx)
+	if ctxErr := contextutil.Check(c); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		if !skipUnsupportedResource(err, conf) {
+			return fmt.Errorf("extract fonts: %w", err)
+		}
+		skipErr = errors.Join(skipErr, fmt.Errorf("extract fonts: %w", err))
+	}
+
+	if err := writeFonts(c, ff, digestFont); err != nil {
+		return fmt.Errorf("extract fonts: form: %w", err)
+	}
+	return errors.Join(unsupportedResourceError(skipErr), contextutil.Check(c))
+}
+
+// ExtractFontsFile writes embedded fontfiles from inFile into outDir for selected pages.
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError after all supported fonts have been written.
+// Extraction supports cancellation.
+func ExtractFontsFile(c context.Context, inFile, outDir string, selectedPages []string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+
 	f, err := os.Open(inFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("extract fonts: open input %s: %w", inFile, err)
 	}
-	defer f.Close()
-	log.CLI.Printf("extracting fonts from %s into %s/ ...\n", inFile, outDir)
-	return ExtractFonts(f, outDir, filepath.Base(inFile), selectedPages, conf)
-}
+	defer func() {
+		err = joinExtractionCleanupError(err, closeFile(f, "extract fonts: close input"))
+	}()
 
-// ExtractPages generates single page PDF files from rs in outDir for selected pages.
-func ExtractPages(rs io.ReadSeeker, outDir, fileName string, selectedPages []string, conf *pdfcpu.Configuration) error {
-	if rs == nil {
-		return errors.New("pdfcpu: ExtractPages: Please provide rs")
+	fnBase := strings.TrimSuffix(filepath.Base(inFile), ".pdf")
+	if err := ExtractFonts(
+		c, f, selectedPages, WriteFontToDisk(c, outDir, fnBase), conf,
+	); err != nil {
+		return fmt.Errorf("extract fonts %s: %w", inFile, err)
 	}
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
-		conf.Cmd = pdfcpu.EXTRACTPAGES
-	}
-
-	fromStart := time.Now()
-	ctx, durRead, durVal, durOpt, err := readValidateAndOptimize(rs, conf, fromStart)
-	if err != nil {
-		return err
-	}
-
-	if err := ctx.EnsurePageCount(); err != nil {
-		return err
-	}
-
-	fromWrite := time.Now()
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, true)
-	if err != nil {
-		return err
-	}
-
-	fileName = strings.TrimSuffix(filepath.Base(fileName), ".pdf")
-
-	for i, v := range pages {
-		if !v {
-			continue
-		}
-		ctxNew, err := ctx.ExtractPage(i)
-		if err != nil {
-			return err
-		}
-		outFile := filepath.Join(outDir, fmt.Sprintf("%s_page_%d.pdf", fileName, i))
-		log.CLI.Printf("writing %s\n", outFile)
-		if err := WriteContextFile(ctxNew, outFile); err != nil {
-			return err
-		}
-	}
-
-	durWrite := time.Since(fromWrite).Seconds()
-	durTotal := time.Since(fromStart).Seconds()
-	log.Stats.Printf("XRefTable:\n%s\n", ctx)
-	pdfcpu.TimingStats("write PDFs", durRead, durVal, durOpt, durWrite, durTotal)
 	return nil
 }
 
-// ExtractPagesFile generates single page PDF files from inFile in outDir for selected pages.
-func ExtractPagesFile(inFile, outDir string, selectedPages []string, conf *pdfcpu.Configuration) error {
+// ExtractPage extracts pageNr out of ctx into an io.Reader and supports cancellation.
+func ExtractPage(c context.Context, ctx *model.Context, pageNr int) (io.Reader, error) {
+	if err := contextutil.Check(c); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		return nil, ErrMissingPDFContext
+	}
+
+	ctxNew, err := pdfcpu.ExtractPages(c, ctx, []int{pageNr}, false)
+	if err != nil {
+		return nil, fmt.Errorf("extract page %d: %w", pageNr, err)
+	}
+
+	var b bytes.Buffer
+	if err := WriteContext(c, ctxNew, &b); err != nil {
+		return nil, fmt.Errorf("extract page %d: write output: %w", pageNr, err)
+	}
+
+	return &b, nil
+}
+
+// ExtractPages retrieves and digests single page PDF files for selected pages and supports cancellation.
+func ExtractPages(c context.Context, rs io.ReadSeeker, selectedPages []string, digestPage func(io.Reader, int) error, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+	if digestPage == nil {
+		return fmt.Errorf("extract pages: %w", ErrMissingDigestFunction)
+	}
+
+	conf = operationConfiguration(conf, model.EXTRACTPAGES)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
+	if err != nil {
+		return fmt.Errorf("extract pages: %w", err)
+	}
+
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, true)
+	if err != nil {
+		return fmt.Errorf("extract pages: parse page selection: %w", err)
+	}
+
+	if len(pages) == 0 {
+		return nil
+	}
+
+	sp := sortedPages(pages)
+
+	for i := range sp {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		pageNr := sp[i]
+		rd, err := ExtractPage(c, ctx, pageNr)
+		if err != nil {
+			return fmt.Errorf("extract pages: %w", err)
+		}
+		if rd == nil {
+			continue
+		}
+
+		if err := digestPage(rd, pageNr); err != nil {
+			return fmt.Errorf("extract pages: page %d: digest: %w", pageNr, err)
+		}
+	}
+
+	return contextutil.Check(c)
+}
+
+// ExtractPagesFile generates single page PDF files for selected pages and supports cancellation.
+func ExtractPagesFile(c context.Context, inFile, outDir string, selectedPages []string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+
 	f, err := os.Open(inFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("extract pages: open input %s: %w", inFile, err)
 	}
-	defer f.Close()
-	log.CLI.Printf("extracting pages from %s into %s/ ...\n", inFile, outDir)
-	return ExtractPages(f, outDir, filepath.Base(inFile), selectedPages, conf)
-}
+	defer func() {
+		err = errors.Join(err, closeFile(f, "extract pages: close input"))
+	}()
 
-// ExtractContent dumps "PDF source" files from rs into outDir for selected pages.
-func ExtractContent(rs io.ReadSeeker, outDir, fileName string, selectedPages []string, conf *pdfcpu.Configuration) error {
-	if rs == nil {
-		return errors.New("pdfcpu: ExtractContent: Please provide rs")
+	fnBase := strings.TrimSuffix(filepath.Base(inFile), ".pdf")
+	if err := ExtractPages(
+		c, f, selectedPages, WritePageToDisk(c, outDir, fnBase), conf,
+	); err != nil {
+		return fmt.Errorf("extract pages %s: %w", inFile, err)
 	}
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
-	}
-
-	fromStart := time.Now()
-	ctx, durRead, durVal, durOpt, err := readValidateAndOptimize(rs, conf, fromStart)
-	if err != nil {
-		return err
-	}
-
-	if err := ctx.EnsurePageCount(); err != nil {
-		return err
-	}
-
-	fromWrite := time.Now()
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, true)
-	if err != nil {
-		return err
-	}
-
-	fileName = strings.TrimSuffix(filepath.Base(fileName), ".pdf")
-
-	for p, v := range pages {
-		if !v {
-			continue
-		}
-		r, err := ctx.ExtractPageContent(p)
-		if err != nil {
-			return err
-		}
-		if r == nil {
-			continue
-		}
-		outFile := filepath.Join(outDir, fmt.Sprintf("%s_Content_page_%d.txt", fileName, p))
-		log.CLI.Printf("writing %s\n", outFile)
-		f, err := os.Create(outFile)
-		if err != nil {
-			return err
-		}
-		if _, err = io.Copy(f, r); err != nil {
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-	}
-
-	durWrite := time.Since(fromWrite).Seconds()
-	durTotal := time.Since(fromStart).Seconds()
-	log.Stats.Printf("XRefTable:\n%s\n", ctx)
-	pdfcpu.TimingStats("write content", durRead, durVal, durOpt, durWrite, durTotal)
 	return nil
 }
 
-// ExtractContentFile dumps "PDF source" files from inFile into outDir for selected pages.
-func ExtractContentFile(inFile, outDir string, selectedPages []string, conf *pdfcpu.Configuration) error {
+// ExtractContent retrieves and digests PDF sources for selected pages and supports cancellation.
+func ExtractContent(c context.Context, rs io.ReadSeeker, selectedPages []string, digestContent func(io.Reader, int) error, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+	if digestContent == nil {
+		return fmt.Errorf("extract content: %w", ErrMissingDigestFunction)
+	}
+
+	conf = operationConfiguration(conf, model.EXTRACTCONTENT)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
+	if err != nil {
+		return fmt.Errorf("extract content: %w", err)
+	}
+
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, true)
+	if err != nil {
+		return fmt.Errorf("extract content: parse page selection: %w", err)
+	}
+
+	for _, pageNr := range sortedPages(pages) {
+		if err := contextutil.Check(c); err != nil {
+			return err
+		}
+		rd, err := pdfcpu.ExtractPageContent(c, ctx, pageNr)
+		if err != nil {
+			return fmt.Errorf("extract content: %w", err)
+		}
+		if rd == nil {
+			continue
+		}
+
+		if err := digestContent(rd, pageNr); err != nil {
+			return fmt.Errorf("extract content: page %d: digest content: %w", pageNr, err)
+		}
+	}
+
+	return contextutil.Check(c)
+}
+
+// ExtractContentFile dumps PDF sources into outDir for selected pages and supports cancellation.
+func ExtractContentFile(c context.Context, inFile, outDir string, selectedPages []string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+
 	f, err := os.Open(inFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("extract content: open input %s: %w", inFile, err)
 	}
-	defer f.Close()
-	log.CLI.Printf("extracting content from %s into %s/ ...\n", inFile, outDir)
-	return ExtractContent(f, outDir, inFile, selectedPages, conf)
+	defer func() {
+		err = errors.Join(err, closeFile(f, "extract content: close input"))
+	}()
+
+	fnBase := strings.TrimSuffix(filepath.Base(inFile), ".pdf")
+	if err := ExtractContent(
+		c, f, selectedPages, WriteContentToDisk(c, outDir, fnBase), conf,
+	); err != nil {
+		return fmt.Errorf("extract content %s: %w", inFile, err)
+	}
+	return nil
 }
 
-// ExtractMetadata dumps all metadata dict entries for rs into outDir.
-func ExtractMetadata(rs io.ReadSeeker, outDir, fileName string, conf *pdfcpu.Configuration) error {
+// ExtractMetadata retrieves and digests all metadata dict entries for rs.
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError after all supported metadata has been digested.
+// Extraction supports cancellation.
+func ExtractMetadata(c context.Context, rs io.ReadSeeker, digestMetadata func(pdfcpu.Metadata) error, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
 	if rs == nil {
-		return errors.New("pdfcpu: ExtractMetadata: Please provide rs")
+		return ErrMissingPDFReadSeeker
 	}
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
+	if digestMetadata == nil {
+		return fmt.Errorf("extract metadata: %w", ErrMissingDigestFunction)
 	}
 
-	fromStart := time.Now()
-	ctx, durRead, durVal, durOpt, err := readValidateAndOptimize(rs, conf, fromStart)
+	conf = operationConfiguration(conf, model.EXTRACTMETADATA)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("extract metadata: %w", err)
 	}
 
-	fromWrite := time.Now()
-
-	mm, err := ctx.ExtractMetadata()
+	mdmd, err := pdfcpu.ExtractMetadata(c, ctx)
+	if ctxErr := contextutil.Check(c); ctxErr != nil {
+		return ctxErr
+	}
 	if err != nil {
-		return err
-	}
-
-	if len(mm) > 0 {
-		fileName = strings.TrimSuffix(filepath.Base(fileName), ".pdf")
-		for _, m := range mm {
-			outFile := filepath.Join(outDir, fmt.Sprintf("%s_Metadata_%s_%d_%d.txt", fileName, m.ParentType, m.ParentObjNr, m.ObjNr))
-			log.CLI.Printf("writing %s\n", outFile)
-			f, err := os.Create(outFile)
-			if err != nil {
-				return err
-			}
-			if _, err = io.Copy(f, m); err != nil {
-				return err
-			}
-			if err := f.Close(); err != nil {
-				return err
-			}
+		if !skipUnsupportedResource(err, conf) {
+			return fmt.Errorf("extract metadata: collect entries: %w", err)
 		}
 	}
 
-	durWrite := time.Since(fromWrite).Seconds()
-	durTotal := time.Since(fromStart).Seconds()
-	log.Stats.Printf("XRefTable:\n%s\n", ctx)
-	pdfcpu.TimingStats("write metadata", durRead, durVal, durOpt, durWrite, durTotal)
-	return nil
+	for _, md := range mdmd {
+		if ctxErr := contextutil.Check(c); ctxErr != nil {
+			return ctxErr
+		}
+		if err := digestMetadata(md); err != nil {
+			return fmt.Errorf("extract metadata: parent obj#%d metadata obj#%d: digest: %w", md.ParentObjNr, md.ObjNr, err)
+		}
+	}
+
+	if err != nil {
+		return unsupportedResourceError(fmt.Errorf("extract metadata: collect entries: %w", err))
+	}
+	return contextutil.Check(c)
 }
 
 // ExtractMetadataFile dumps all metadata dict entries for inFile into outDir.
-func ExtractMetadataFile(inFile, outDir string, conf *pdfcpu.Configuration) error {
-	f, err := os.Open(inFile)
-	if err != nil {
+// Unsupported resources are handled according to conf.UnsupportedResourcePolicy.
+// In skip mode err contains an *UnsupportedResourceError after all supported metadata has been written.
+// Extraction supports cancellation.
+func ExtractMetadataFile(c context.Context, inFile, outDir string, conf *model.Configuration) (err error) {
+	if err := contextutil.Check(c); err != nil {
 		return err
 	}
-	defer f.Close()
-	log.CLI.Printf("extracting metadata from %s into %s/ ...\n", inFile, outDir)
-	return ExtractMetadata(f, outDir, filepath.Base(inFile), conf)
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
+
+	f, err := os.Open(inFile)
+	if err != nil {
+		return fmt.Errorf("extract metadata: open input %s: %w", inFile, err)
+	}
+	defer func() {
+		err = joinExtractionCleanupError(err, closeFile(f, "extract metadata: close input"))
+	}()
+
+	fileNameBase := strings.TrimSuffix(filepath.Base(inFile), ".pdf")
+	if err := ExtractMetadata(
+		c, f, WriteMetadataToDisk(c, outDir, fileNameBase), conf,
+	); err != nil {
+		return fmt.Errorf("extract metadata %s: %w", inFile, err)
+	}
+	return nil
 }

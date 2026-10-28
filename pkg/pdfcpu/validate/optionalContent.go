@@ -17,17 +17,161 @@ limitations under the License.
 package validate
 
 import (
-	pdf "github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
-	"github.com/pkg/errors"
+	"errors"
+	"fmt"
+
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
-func validateOptionalContentGroupIntent(xRefTable *pdf.XRefTable, d pdf.Dict, dictName, entryName string, required bool, sinceVersion pdf.Version) error {
+var errVisibilityExpressionCycle = errors.New("circular visibility expression")
 
+type visibilityExpressionTraversal struct {
+	xRefTable *model.XRefTable
+	ancestors map[int]bool
+	validated map[int]int
+}
+
+func visibilityExpressionIdentity(o types.Object) int {
+	ir, ok := o.(types.IndirectRef)
+	if !ok {
+		return 0
+	}
+	return ir.ObjectNumber.Value()
+}
+
+func (t *visibilityExpressionTraversal) enter(objNr int) error {
+	if objNr <= 0 {
+		return nil
+	}
+	if t.ancestors[objNr] {
+		return fmt.Errorf("obj#%d: %w", objNr, errVisibilityExpressionCycle)
+	}
+	t.ancestors[objNr] = true
+	return nil
+}
+
+func (t *visibilityExpressionTraversal) leave(objNr int) {
+	if objNr > 0 {
+		delete(t.ancestors, objNr)
+	}
+}
+
+// alreadyValidated reports whether a shared expression succeeded at depth or deeper.
+// A deeper path needs revalidation to preserve descendant depth checks.
+func (t *visibilityExpressionTraversal) alreadyValidated(objNr, depth int) bool {
+	if objNr <= 0 {
+		return false
+	}
+	validatedDepth, ok := t.validated[objNr]
+	return ok && depth <= validatedDepth
+}
+
+func (t *visibilityExpressionTraversal) markValidated(objNr, depth int) {
+	if objNr <= 0 {
+		return
+	}
+	if previous, ok := t.validated[objNr]; !ok || depth > previous {
+		t.validated[objNr] = depth
+	}
+}
+
+func visibilityExpressionCardinality(a types.Array, objNr int, path, operator string) error {
+	if operator == "Not" && len(a) == 2 || operator != "Not" && len(a) >= 2 {
+		return nil
+	}
+	expected := "an operator and one or more operands"
+	if operator == "Not" {
+		expected = "Not and exactly one operand"
+	}
+	err := fmt.Errorf("%s: invalid array length %d, expected %s", path, len(a), expected)
+	return model.WithValidationErrorObject(err, objNr)
+}
+
+func (t *visibilityExpressionTraversal) validateOperand(raw types.Object, ownerObjNr int, path string, depth int) error {
+	objNr := validationObjectNumber(ownerObjNr, raw)
+	o, err := t.xRefTable.Dereference(raw)
+	if err != nil {
+		err = fmt.Errorf("%s: dereference operand: %w", path, err)
+		return model.WithValidationErrorObject(err, objNr)
+	}
+	switch o := o.(type) {
+	case types.Dict:
+		if err = validateOptionalContentGroupDict(t.xRefTable, o, objNr, model.V15); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		return nil
+	case types.Array:
+		return t.validateArray(o, objNr, visibilityExpressionIdentity(raw), path, depth)
+	default:
+		err = fmt.Errorf("%s: expected optional content group or visibility expression, got %T", path, o)
+		return model.WithValidationErrorObject(err, objNr)
+	}
+}
+
+func (t *visibilityExpressionTraversal) validateArray(a types.Array, objNr, identity int, path string, depth int) error {
+	if err := t.xRefTable.CheckRecursionDepth("visibility expression", depth); err != nil {
+		return model.WithValidationErrorObject(err, objNr)
+	}
+	if err := t.enter(identity); err != nil {
+		return model.WithValidationErrorObject(err, objNr)
+	}
+	defer t.leave(identity)
+	if t.alreadyValidated(identity, depth) {
+		return nil
+	}
+	if len(a) == 0 {
+		err := fmt.Errorf("%s: invalid array length 0, expected an operator and one or more operands", path)
+		return model.WithValidationErrorObject(err, objNr)
+	}
+	operatorObjNr := validationObjectNumber(objNr, a[0])
+	o, err := t.xRefTable.Dereference(a[0])
+	if err != nil {
+		err = fmt.Errorf("%s[0]: dereference operator: %w", path, err)
+		return model.WithValidationErrorObject(err, operatorObjNr)
+	}
+	operator, ok := o.(types.Name)
+	if !ok || !types.MemberOf(operator.Value(), []string{"And", "Or", "Not"}) {
+		err = fmt.Errorf("%s[0]: expected And, Or, or Not operator", path)
+		return model.WithValidationErrorObject(err, operatorObjNr)
+	}
+	if err = visibilityExpressionCardinality(a, objNr, path, operator.Value()); err != nil {
+		return err
+	}
+	for i := 1; i < len(a); i++ {
+		if err = t.validateOperand(a[i], objNr, fmt.Sprintf("%s[%d]", path, i), depth+1); err != nil {
+			return model.WrapRecursionError(path, err)
+		}
+	}
+	t.markValidated(identity, depth)
+	return nil
+}
+
+func validateVisibilityExpressionEntry(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int) error {
+	const (
+		dictName  = "OCMDict"
+		entryName = "VE"
+	)
+	raw := d[entryName]
+	a, err := validateArrayEntry(xRefTable, d, ownerObjNr, dictName, entryName, OPTIONAL, model.V16, nil)
+	if err != nil || a == nil {
+		return err
+	}
+	objNr := validationEntryObjectNumber(ownerObjNr, d, entryName)
+	t := visibilityExpressionTraversal{xRefTable: xRefTable, ancestors: map[int]bool{}, validated: map[int]int{}}
+	return t.validateArray(a, objNr, visibilityExpressionIdentity(raw), dictName+"."+entryName, 0)
+}
+
+func validateOptionalContentGroupIntent(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName, entryName string, required bool, sinceVersion model.Version) (err error) {
 	// see 8.11.2.1
 
-	o, err := validateEntry(xRefTable, d, dictName, entryName, required, sinceVersion)
+	entryObjNr := validationEntryObjectNumber(ownerObjNr, d, entryName)
+	o, err := validateEntry(xRefTable, d, ownerObjNr, dictName, entryName, required, sinceVersion)
 	if err != nil || o == nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("%s.%s: %w", dictName, entryName, err)
+		}
+		return nil
 	}
 
 	validate := func(s string) bool {
@@ -36,148 +180,184 @@ func validateOptionalContentGroupIntent(xRefTable *pdf.XRefTable, d pdf.Dict, di
 
 	switch o := o.(type) {
 
-	case pdf.Name:
+	case types.Name:
 		if !validate(o.Value()) {
-			return errors.Errorf("validateOptionalContentGroupIntent: invalid intent: %s", o.Value())
+			err = fmt.Errorf("%s.%s: invalid intent: %s", dictName, entryName, o.Value())
+			return model.WithValidationErrorObject(err, entryObjNr)
 		}
 
-	case pdf.Array:
+	case types.Array:
 
 		for i, v := range o {
+			intentObjNr := validationObjectNumber(entryObjNr, v)
 
 			if v == nil {
 				continue
 			}
 
-			n, ok := v.(pdf.Name)
+			o, err := xRefTable.Dereference(v)
+			if err != nil {
+				err = fmt.Errorf("%s.%s[%d]: %w", dictName, entryName, i, err)
+				return model.WithValidationErrorObject(err, intentObjNr)
+			}
+			n, ok := o.(types.Name)
 			if !ok {
-				return errors.Errorf("pdfcpu: validateOptionalContentGroupIntent: invalid type at index %d\n", i)
+				err = fmt.Errorf("%s.%s[%d]: invalid type", dictName, entryName, i)
+				return model.WithValidationErrorObject(err, intentObjNr)
 			}
 
 			if !validate(n.Value()) {
-				return errors.Errorf("pdfcpu: validateOptionalContentGroupIntent: invalid intent: %s", n.Value())
+				err = fmt.Errorf("%s.%s[%d]: invalid intent: %s", dictName, entryName, i, n.Value())
+				return model.WithValidationErrorObject(err, intentObjNr)
 			}
 		}
 
 	default:
-		return errors.New("pdfcpu: validateOptionalContentGroupIntent: invalid type")
+		err = fmt.Errorf("%s.%s: %w", dictName, entryName, errors.New("invalid type"))
+		return model.WithValidationErrorObject(err, entryObjNr)
 	}
 
 	return nil
 }
 
-func validateOptionalContentGroupUsageDict(xRefTable *pdf.XRefTable, d pdf.Dict, dictName, entryName string, required bool, sinceVersion pdf.Version) error {
-
+func validateOptionalContentGroupUsageDict(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName, entryName string, required bool, sinceVersion model.Version) (err error) {
 	// see 8.11.4.4
 
-	d1, err := validateDictEntry(xRefTable, d, dictName, entryName, required, sinceVersion, nil)
+	usageObjNr := validationEntryObjectNumber(ownerObjNr, d, entryName)
+	d1, err := validateDictEntry(
+		xRefTable, d, ownerObjNr, dictName, entryName, required, sinceVersion, nil,
+	)
 	if err != nil || d1 == nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("%s.%s: %w", dictName, entryName, err)
+		}
+		return nil
 	}
 
 	dictName = "OCUsageDict"
+	defer func() {
+		err = model.WithValidationErrorObject(err, usageObjNr)
+	}()
 
 	// CreatorInfo, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "CreatorInfo", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "CreatorInfo", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.CreatorInfo: %w", dictName, err)
 	}
 
 	// Language, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "Language", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "Language", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Language: %w", dictName, err)
 	}
 
 	// Export, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "Export", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "Export", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Export: %w", dictName, err)
 	}
 
 	// Zoom, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "Zoom", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "Zoom", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Zoom: %w", dictName, err)
 	}
 
 	// Print, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "Print", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "Print", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Print: %w", dictName, err)
 	}
 
 	// View, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "View", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "View", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.View: %w", dictName, err)
 	}
 
 	// User, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "User", OPTIONAL, sinceVersion, nil)
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "User", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.User: %w", dictName, err)
 	}
 
 	// PageElement, optional, dict
-	_, err = validateDictEntry(xRefTable, d1, dictName, "PageElement", OPTIONAL, sinceVersion, nil)
-
-	return err
+	_, err = validateDictEntry(xRefTable, d1, usageObjNr, dictName, "PageElement", OPTIONAL, sinceVersion, nil)
+	if err != nil {
+		return fmt.Errorf("%s.PageElement: %w", dictName, err)
+	}
+	return nil
 }
 
-func validateOptionalContentGroupDict(xRefTable *pdf.XRefTable, d pdf.Dict, sinceVersion pdf.Version) error {
+func validateOptionalContentGroupDict(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, sinceVersion model.Version) (err error) {
+	defer func() {
+		err = model.WithValidationErrorObject(err, ownerObjNr)
+	}()
 
 	// see 8.11 Optional Content
 
 	dictName := "optionalContentGroupDict"
 
 	// Type, required, name, OCG
-	_, err := validateNameEntry(xRefTable, d, dictName, "Type", REQUIRED, sinceVersion, func(s string) bool { return s == "OCG" })
+	_, err = validateNameEntry(
+		xRefTable, d, ownerObjNr, dictName, "Type", REQUIRED, sinceVersion, func(s string) bool { return s == "OCG" },
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Type: %w", dictName, err)
 	}
 
 	// Name, required, text string
-	_, err = validateStringEntry(xRefTable, d, dictName, "Name", REQUIRED, sinceVersion, nil)
+	_, err = validateStringEntry(xRefTable, d, ownerObjNr, dictName, "Name", REQUIRED, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Name: %w", dictName, err)
 	}
 
 	// Intent, optional, name or array
-	err = validateOptionalContentGroupIntent(xRefTable, d, dictName, "Intent", OPTIONAL, sinceVersion)
+	err = validateOptionalContentGroupIntent(
+		xRefTable, d, ownerObjNr, dictName, "Intent", OPTIONAL, sinceVersion,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Intent: %w", dictName, err)
 	}
 
 	// Usage, optional, usage dict
-	return validateOptionalContentGroupUsageDict(xRefTable, d, dictName, "Usage", OPTIONAL, sinceVersion)
+	return validateOptionalContentGroupUsageDict(
+		xRefTable, d, ownerObjNr, dictName, "Usage", OPTIONAL, sinceVersion,
+	)
 }
 
-func validateOptionalContentGroupArray(xRefTable *pdf.XRefTable, d pdf.Dict, dictName, dictEntry string, sinceVersion pdf.Version) error {
-
-	a, err := validateArrayEntry(xRefTable, d, dictName, dictEntry, OPTIONAL, sinceVersion, nil)
+func validateOptionalContentGroupArray(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName, dictEntry string, sinceVersion model.Version) error {
+	arrayObjNr := validationEntryObjectNumber(ownerObjNr, d, dictEntry)
+	a, err := validateArrayEntry(
+		xRefTable, d, ownerObjNr, dictName, dictEntry, OPTIONAL, sinceVersion, nil,
+	)
 	if err != nil || a == nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("%s.%s: %w", dictName, dictEntry, err)
+		}
+		return nil
 	}
 
-	for _, v := range a {
+	for i, v := range a {
 
 		if v == nil {
 			continue
 		}
 
+		groupObjNr := validationObjectNumber(arrayObjNr, v)
 		d, err := xRefTable.DereferenceDict(v)
 		if err != nil {
-			return err
+			err = fmt.Errorf("%s: dereference optional content group dict: %w", objectContext(fmt.Sprintf("%s.%s[%d]", dictName, dictEntry, i), v), err)
+			return model.WithValidationErrorObject(err, groupObjNr)
 		}
 
 		if d == nil {
 			continue
 		}
 
-		err = validateOptionalContentGroupDict(xRefTable, d, sinceVersion)
+		err = validateOptionalContentGroupDict(xRefTable, d, groupObjNr, sinceVersion)
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", objectContext(fmt.Sprintf("%s.%s[%d]", dictName, dictEntry, i), v), err)
 		}
 
 	}
@@ -185,126 +365,173 @@ func validateOptionalContentGroupArray(xRefTable *pdf.XRefTable, d pdf.Dict, dic
 	return nil
 }
 
-func validateOCGs(xRefTable *pdf.XRefTable, d pdf.Dict, dictName, entryName string, sinceVersion pdf.Version) error {
-
+func validateOCGs(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName, entryName string, sinceVersion model.Version) error {
 	// see 8.11.2.2
 
-	o, err := d.Entry(dictName, entryName, OPTIONAL)
+	o, _, err := d.Entry(dictName, entryName, OPTIONAL)
 	if err != nil || o == nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("%s.%s: %w", dictName, entryName, err)
+		}
+		return nil
 	}
+
+	rawEntry := o
+	entryObjNr := validationObjectNumber(ownerObjNr, rawEntry)
 
 	// Version check
 	err = xRefTable.ValidateVersion("OCGs", sinceVersion)
 	if err != nil {
-		return err
+		err = fmt.Errorf("%s.%s: %w", dictName, entryName, err)
+		return model.WithValidationErrorObject(err, entryObjNr)
 	}
 
 	o, err = xRefTable.Dereference(o)
 	if err != nil || o == nil {
-		return err
+		if err != nil {
+			err = fmt.Errorf("%s: dereference: %w", objectContext(dictEntryContext(dictName, entryName, rawEntry), rawEntry), err)
+			return model.WithValidationErrorObject(err, entryObjNr)
+		}
+		return nil
 	}
 
-	d1, ok := o.(pdf.Dict)
+	d1, ok := o.(types.Dict)
 	if ok {
-		return validateOptionalContentGroupDict(xRefTable, d1, sinceVersion)
+		if err := validateOptionalContentGroupDict(xRefTable, d1, entryObjNr, sinceVersion); err != nil {
+			return fmt.Errorf("%s: %w", objectContext(dictEntryContext(dictName, entryName, rawEntry), rawEntry), err)
+		}
+		return nil
 	}
 
-	return validateOptionalContentGroupArray(xRefTable, d, dictName, entryName, sinceVersion)
+	return validateOptionalContentGroupArray(xRefTable, d, ownerObjNr, dictName, entryName, sinceVersion)
 }
 
-func validateOptionalContentMembershipDict(xRefTable *pdf.XRefTable, d pdf.Dict, sinceVersion pdf.Version) error {
+func validateOptionalContentMembershipDict(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, sinceVersion model.Version) (err error) {
+	defer func() {
+		err = model.WithValidationErrorObject(err, ownerObjNr)
+	}()
 
 	// see 8.11.2.2
 
 	dictName := "OCMDict"
 
 	// OCGs, optional, dict or array
-	err := validateOCGs(xRefTable, d, dictName, "OCGs", sinceVersion)
+	err = validateOCGs(xRefTable, d, ownerObjNr, dictName, "OCGs", sinceVersion)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.OCGs: %w", dictName, err)
 	}
 
 	// P, optional, name
-	validate := func(s string) bool { return pdf.MemberOf(s, []string{"AllOn", "AnyOn", "AnyOff", "AllOff"}) }
-	_, err = validateNameEntry(xRefTable, d, dictName, "P", OPTIONAL, sinceVersion, validate)
+	validate := func(s string) bool { return types.MemberOf(s, []string{"AllOn", "AnyOn", "AnyOff", "AllOff"}) }
+	_, err = validateNameEntry(xRefTable, d, ownerObjNr, dictName, "P", OPTIONAL, sinceVersion, validate)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.P: %w", dictName, err)
 	}
 
 	// VE, optional, array, since V1.6
-	_, err = validateArrayEntry(xRefTable, d, dictName, "VE", OPTIONAL, pdf.V16, nil)
-
-	return err
+	err = validateVisibilityExpressionEntry(xRefTable, d, ownerObjNr)
+	if err != nil {
+		return fmt.Errorf("%s.VE: %w", dictName, err)
+	}
+	return nil
 }
 
-func validateOptionalContent(xRefTable *pdf.XRefTable, d pdf.Dict, dictName, entryName string, required bool, sinceVersion pdf.Version) error {
-
-	d1, err := validateDictEntry(xRefTable, d, dictName, entryName, required, sinceVersion, nil)
+func validateOptionalContent(xRefTable *model.XRefTable, d types.Dict, dictName, entryName string, required bool, sinceVersion model.Version) error {
+	rawEntry := d[entryName]
+	entryObjNr := validationObjectNumber(0, rawEntry)
+	d1, err := validateDictEntry(xRefTable, d, 0, dictName, entryName, required, sinceVersion, nil)
 	if err != nil || d1 == nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("%s: %w", dictEntryContext(dictName, entryName, rawEntry), err)
+		}
+		return nil
 	}
 
 	validate := func(s string) bool { return s == "OCG" || s == "OCMD" }
-	t, err := validateNameEntry(xRefTable, d1, "optionalContent", "Type", REQUIRED, sinceVersion, validate)
+	t, err := validateNameEntry(
+		xRefTable, d1, entryObjNr, "optionalContent", "Type", REQUIRED, sinceVersion, validate,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Type: %w", dictEntryContext(dictName, entryName, rawEntry), err)
 	}
 
 	if *t == "OCG" {
-		return validateOptionalContentGroupDict(xRefTable, d1, sinceVersion)
+		if err := validateOptionalContentGroupDict(xRefTable, d1, entryObjNr, sinceVersion); err != nil {
+			return fmt.Errorf("%s: %w", dictEntryContext(dictName, entryName, rawEntry), err)
+		}
+		return nil
 	}
 
-	return validateOptionalContentMembershipDict(xRefTable, d1, sinceVersion)
+	if err := validateOptionalContentMembershipDict(xRefTable, d1, entryObjNr, sinceVersion); err != nil {
+		return fmt.Errorf("%s: %w", dictEntryContext(dictName, entryName, rawEntry), err)
+	}
+	return nil
 }
 
-func validateUsageApplicationDict(xRefTable *pdf.XRefTable, d pdf.Dict, sinceVersion pdf.Version) error {
+func validateUsageApplicationDict(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, sinceVersion model.Version) (err error) {
+	defer func() {
+		err = model.WithValidationErrorObject(err, ownerObjNr)
+	}()
 
 	dictName := "usageAppDict"
 
 	// Event, required, name
-	_, err := validateNameEntry(xRefTable, d, dictName, "Event", REQUIRED, sinceVersion, func(s string) bool { return s == "View" || s == "Print" || s == "Export" })
+	_, err = validateNameEntry(
+		xRefTable, d, ownerObjNr, dictName, "Event", REQUIRED, sinceVersion,
+		func(s string) bool { return s == "View" || s == "Print" || s == "Export" },
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Event: %w", dictName, err)
 	}
 
 	// OCGs, optional, array of content groups
-	err = validateOptionalContentGroupArray(xRefTable, d, dictName, "OCGs", sinceVersion)
+	err = validateOptionalContentGroupArray(xRefTable, d, ownerObjNr, dictName, "OCGs", sinceVersion)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.OCGs: %w", dictName, err)
 	}
 
 	// Category, required, array of names
-	_, err = validateNameArrayEntry(xRefTable, d, dictName, "Category", REQUIRED, sinceVersion, nil)
-
-	return err
+	_, err = validateNameArrayEntry(
+		xRefTable, d, ownerObjNr, dictName, "Category", REQUIRED, sinceVersion, nil,
+	)
+	if err != nil {
+		return fmt.Errorf("%s.Category: %w", dictName, err)
+	}
+	return nil
 }
 
-func validateUsageApplicationDictArray(xRefTable *pdf.XRefTable, d pdf.Dict, dictName, dictEntry string, required bool, sinceVersion pdf.Version) error {
-
-	a, err := validateArrayEntry(xRefTable, d, dictName, dictEntry, required, sinceVersion, nil)
+func validateUsageApplicationDictArray(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName, dictEntry string, required bool, sinceVersion model.Version) error {
+	arrayObjNr := validationEntryObjectNumber(ownerObjNr, d, dictEntry)
+	a, err := validateArrayEntry(
+		xRefTable, d, ownerObjNr, dictName, dictEntry, required, sinceVersion, nil,
+	)
 	if err != nil || a == nil {
-		return err
+		if err != nil {
+			return fmt.Errorf("%s.%s: %w", dictName, dictEntry, err)
+		}
+		return nil
 	}
 
-	for _, v := range a {
+	for i, v := range a {
 
 		if v == nil {
 			continue
 		}
 
+		usageObjNr := validationObjectNumber(arrayObjNr, v)
 		d, err := xRefTable.DereferenceDict(v)
 		if err != nil {
-			return err
+			err = fmt.Errorf("%s: dereference usage application dict: %w", objectContext(fmt.Sprintf("%s.%s[%d]", dictName, dictEntry, i), v), err)
+			return model.WithValidationErrorObject(err, usageObjNr)
 		}
 
 		if d == nil {
 			continue
 		}
 
-		err = validateUsageApplicationDict(xRefTable, d, sinceVersion)
+		err = validateUsageApplicationDict(xRefTable, d, usageObjNr, sinceVersion)
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", objectContext(fmt.Sprintf("%s.%s[%d]", dictName, dictEntry, i), v), err)
 		}
 
 	}
@@ -312,144 +539,196 @@ func validateUsageApplicationDictArray(xRefTable *pdf.XRefTable, d pdf.Dict, dic
 	return nil
 }
 
-func validateOptionalContentConfigurationDict(xRefTable *pdf.XRefTable, d pdf.Dict, sinceVersion pdf.Version) error {
-
-	dictName := "optContentConfigDict"
-
-	// Name, optional, string
-	_, err := validateStringEntry(xRefTable, d, dictName, "Name", OPTIONAL, sinceVersion, nil)
-	if err != nil {
-		return err
-	}
-
-	// Creator, optional, string
-	_, err = validateStringEntry(xRefTable, d, dictName, "Creator", OPTIONAL, sinceVersion, nil)
-	if err != nil {
-		return err
-	}
-
+func validateOptionalContentConfigBaseState(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName string, sinceVersion model.Version) error {
 	// BaseState, optional, name
-	validate := func(s string) bool { return pdf.MemberOf(s, []string{"ON", "OFF", "UNCHANGED"}) }
-	baseState, err := validateNameEntry(xRefTable, d, dictName, "BaseState", OPTIONAL, sinceVersion, validate)
+	validate := func(s string) bool { return types.MemberOf(s, []string{"ON", "OFF", "UNCHANGED"}) }
+	baseState, err := validateNameEntry(
+		xRefTable, d, ownerObjNr, dictName, "BaseState", OPTIONAL, sinceVersion, validate,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.BaseState: %w", dictName, err)
 	}
 
 	if baseState != nil {
 
 		if baseState.Value() != "ON" {
 			// ON, optional, content group array
-			err = validateOptionalContentGroupArray(xRefTable, d, dictName, "ON", sinceVersion)
+			err = validateOptionalContentGroupArray(xRefTable, d, ownerObjNr, dictName, "ON", sinceVersion)
 			if err != nil {
-				return err
+				return fmt.Errorf("%s.ON: %w", dictName, err)
 			}
 		}
 
 		if baseState.Value() != "OFF" {
 			// OFF, optional, content group array
-			err = validateOptionalContentGroupArray(xRefTable, d, dictName, "OFF", sinceVersion)
+			err = validateOptionalContentGroupArray(xRefTable, d, ownerObjNr, dictName, "OFF", sinceVersion)
 			if err != nil {
-				return err
+				return fmt.Errorf("%s.OFF: %w", dictName, err)
 			}
 		}
 
 	}
 
-	// Intent, optional, name or array
-	err = validateOptionalContentGroupIntent(xRefTable, d, dictName, "Intent", OPTIONAL, sinceVersion)
+	return nil
+}
+
+func validateOptionalContentConfigurationDict(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, sinceVersion model.Version) (err error) {
+	defer func() {
+		err = model.WithValidationErrorObject(err, ownerObjNr)
+	}()
+
+	dictName := "optContentConfigDict"
+
+	// Name, optional, string
+	_, err = validateStringEntry(xRefTable, d, ownerObjNr, dictName, "Name", OPTIONAL, sinceVersion, nil)
 	if err != nil {
+		return fmt.Errorf("%s.Name: %w", dictName, err)
+	}
+
+	// Creator, optional, string
+	_, err = validateStringEntry(xRefTable, d, ownerObjNr, dictName, "Creator", OPTIONAL, sinceVersion, nil)
+	if err != nil {
+		return fmt.Errorf("%s.Creator: %w", dictName, err)
+	}
+
+	if err := validateOptionalContentConfigBaseState(xRefTable, d, ownerObjNr, dictName, sinceVersion); err != nil {
 		return err
+	}
+
+	// Intent, optional, name or array
+	err = validateOptionalContentGroupIntent(
+		xRefTable, d, ownerObjNr, dictName, "Intent", OPTIONAL, sinceVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("%s.Intent: %w", dictName, err)
 	}
 
 	// AS, optional, usage application dicts array
-	err = validateUsageApplicationDictArray(xRefTable, d, dictName, "AS", OPTIONAL, sinceVersion)
+	err = validateUsageApplicationDictArray(
+		xRefTable, d, ownerObjNr, dictName, "AS", OPTIONAL, sinceVersion,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.AS: %w", dictName, err)
 	}
 
 	// Order, optional, array
-	_, err = validateArrayEntry(xRefTable, d, dictName, "Order", OPTIONAL, sinceVersion, nil)
+	_, err = validateArrayEntry(xRefTable, d, ownerObjNr, dictName, "Order", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Order: %w", dictName, err)
 	}
 
 	// ListMode, optional, name
-	validate = func(s string) bool { return pdf.MemberOf(s, []string{"AllPages", "VisiblePages"}) }
-	_, err = validateNameEntry(xRefTable, d, dictName, "ListMode", OPTIONAL, sinceVersion, validate)
+	validate := func(s string) bool { return types.MemberOf(s, []string{"AllPages", "VisiblePages"}) }
+	_, err = validateNameEntry(xRefTable, d, ownerObjNr, dictName, "ListMode", OPTIONAL, sinceVersion, validate)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.ListMode: %w", dictName, err)
 	}
 
 	// RBGroups, optional, array
-	_, err = validateArrayEntry(xRefTable, d, dictName, "RBGroups", OPTIONAL, sinceVersion, nil)
+	_, err = validateArrayEntry(xRefTable, d, ownerObjNr, dictName, "RBGroups", OPTIONAL, sinceVersion, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.RBGroups: %w", dictName, err)
 	}
 
 	// Locked, optional, array
-	return validateOptionalContentGroupArray(xRefTable, d, dictName, "Locked", pdf.V16)
+	sinceVersion = model.V16
+	if xRefTable.ValidationMode == model.ValidationRelaxed {
+		sinceVersion = model.V15
+	}
+	if err := validateOptionalContentGroupArray(xRefTable, d, ownerObjNr, dictName, "Locked", sinceVersion); err != nil {
+		return fmt.Errorf("%s.Locked: %w", dictName, err)
+	}
+	return nil
 }
 
-func validateOCProperties(xRefTable *pdf.XRefTable, rootDict pdf.Dict, required bool, sinceVersion pdf.Version) error {
-
-	// aka optional content properties dict.
-
-	// => 8.11.4 Configuring Optional Content
-
-	if xRefTable.ValidationMode == pdf.ValidationRelaxed {
-		sinceVersion = pdf.V14
+func validateOCPropertiesD(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, dictName string, sinceVersion model.Version) error {
+	required := REQUIRED
+	relaxed := xRefTable.ValidationMode == model.ValidationRelaxed
+	if relaxed {
+		required = OPTIONAL
 	}
 
-	d, err := validateDictEntry(xRefTable, rootDict, "rootDict", "OCProperties", required, sinceVersion, nil)
+	dObjNr := validationEntryObjectNumber(ownerObjNr, d, "D")
+	d1, err := validateDictEntry(xRefTable, d, ownerObjNr, dictName, "D", required, sinceVersion, nil)
+	if err != nil {
+		return fmt.Errorf("%s.D: %w", dictName, err)
+	}
+	if d1 == nil {
+		if relaxed {
+			model.ShowDigestedSpecViolation("dict=" + dictName + " required entry=D missing")
+		}
+		return nil
+	}
+	if err = validateOptionalContentConfigurationDict(xRefTable, d1, dObjNr, sinceVersion); err != nil {
+		return fmt.Errorf("%s.D: %w", dictName, err)
+	}
+	return nil
+}
+
+// validateOCProperties validates the optional content properties dictionary described in 8.11.4.
+func validateOCProperties(xRefTable *model.XRefTable, rootDict types.Dict, required bool, sinceVersion model.Version) error {
+	if xRefTable.ValidationMode == model.ValidationRelaxed {
+		sinceVersion = model.V14
+	}
+
+	rootObjNr := validationRootObjectNumber(xRefTable)
+	ocPropertiesObjNr := validationEntryObjectNumber(rootObjNr, rootDict, "OCProperties")
+	d, err := validateDictEntry(
+		xRefTable, rootDict, rootObjNr, "rootDict", "OCProperties", required, sinceVersion, nil,
+	)
 	if err != nil || len(d) == 0 {
-		return err
+		if err != nil {
+			return fmt.Errorf("rootDict.OCProperties: %w", err)
+		}
+		return nil
 	}
 
 	dictName := "optContentPropertiesDict"
 
 	// "OCGs" required array of already written indRefs
-	r := true
-	if xRefTable.ValidationMode == pdf.ValidationRelaxed {
-		r = false
+	r := REQUIRED
+	if xRefTable.ValidationMode == model.ValidationRelaxed {
+		r = OPTIONAL
 	}
-	_, err = validateIndRefArrayEntry(xRefTable, d, dictName, "OCGs", r, sinceVersion, nil)
+	_, err = validateIndRefArrayEntry(xRefTable, d, 0, dictName, "OCGs", r, sinceVersion, nil)
 	if err != nil {
-		return err
+		err = fmt.Errorf("%s.OCGs: %w", dictName, err)
+		return model.WithValidationErrorObject(
+			err, validationEntryObjectNumber(ocPropertiesObjNr, d, "OCGs"),
+		)
 	}
 
 	// "D" required dict, default viewing optional content configuration dict.
-	d1, err := validateDictEntry(xRefTable, d, dictName, "D", REQUIRED, sinceVersion, nil)
-	if err != nil {
-		return err
-	}
-	err = validateOptionalContentConfigurationDict(xRefTable, d1, sinceVersion)
-	if err != nil {
+	if err = validateOCPropertiesD(xRefTable, d, ocPropertiesObjNr, dictName, sinceVersion); err != nil {
 		return err
 	}
 
 	// "Configs" optional array of alternate optional content configuration dicts.
-	a, err := validateArrayEntry(xRefTable, d, dictName, "Configs", OPTIONAL, sinceVersion, nil)
+	a, err := validateArrayEntry(
+		xRefTable, d, ocPropertiesObjNr, dictName, "Configs", OPTIONAL, sinceVersion, nil,
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s.Configs: %w", dictName, err)
 	}
-	if a != nil {
-		for _, o := range a {
+	configsObjNr := validationEntryObjectNumber(ocPropertiesObjNr, d, "Configs")
+	for i, o := range a {
+		configObjNr := validationObjectNumber(configsObjNr, o)
 
-			d, err := xRefTable.DereferenceDict(o)
-			if err != nil {
-				return err
-			}
-
-			if d == nil {
-				continue
-			}
-
-			err = validateOptionalContentConfigurationDict(xRefTable, d, sinceVersion)
-			if err != nil {
-				return err
-			}
-
+		d, err := xRefTable.DereferenceDict(o)
+		if err != nil {
+			err = fmt.Errorf("%s: dereference optional content configuration dict: %w", objectContext(fmt.Sprintf("%s.Configs[%d]", dictName, i), o), err)
+			return model.WithValidationErrorObject(err, configObjNr)
 		}
+
+		if d == nil {
+			continue
+		}
+
+		err = validateOptionalContentConfigurationDict(xRefTable, d, configObjNr, sinceVersion)
+		if err != nil {
+			return fmt.Errorf("%s: %w", objectContext(fmt.Sprintf("%s.Configs[%d]", dictName, i), o), err)
+		}
+
 	}
 
 	return nil

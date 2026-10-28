@@ -21,13 +21,13 @@ import (
 	"testing"
 
 	"github.com/pdfcpu/pdfcpu/pkg/cli"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-func optimizeFile(t *testing.T, fileName string, conf *pdfcpu.Configuration) error {
+func optimizeFile(t *testing.T, fileName string, conf *model.Configuration) error {
 	t.Helper()
 	cmd := cli.OptimizeCommand(fileName, "", conf)
-	_, err := cli.Process(cmd)
+	_, err := cli.Dispatch(t.Context(), cmd)
 	return err
 }
 
@@ -36,27 +36,24 @@ func testOptimizeFile(t *testing.T, inFile, outFile string) {
 	msg := "testOptimizeFile"
 
 	// Optimize inFile and write result to outFile.
-	cmd := cli.OptimizeCommand(inFile, outFile, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.OptimizeCommand(inFile, outFile, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, inFile, err)
 	}
 
 	// Optimize outFile and write result to outFile.
-	cmd = cli.OptimizeCommand(outFile, "", nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.OptimizeCommand(outFile, "", conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Optimize outFile and write result to outFile.
-	// Also skip validation.
-	c := pdfcpu.NewDefaultConfiguration()
-	c.ValidationMode = pdfcpu.ValidationNone
-
-	if err := optimizeFile(t, outFile, c); err != nil {
+	if err := optimizeFile(t, outFile, nil); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 }
 
+// TestOptimizeCommand verifies optimize command.
 func TestOptimizeCommand(t *testing.T) {
 	for _, f := range allPDFs(t, inDir) {
 		inFile := filepath.Join(inDir, f)

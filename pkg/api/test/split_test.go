@@ -21,8 +21,10 @@ import (
 	"testing"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
 )
 
+// TestSplitSpan1 verifies split span1.
 func TestSplitSpan1(t *testing.T) {
 	msg := "TestSplitSpan1"
 	fileName := "Acroforms2.pdf"
@@ -30,11 +32,12 @@ func TestSplitSpan1(t *testing.T) {
 
 	// Create single page files of inFile in outDir.
 	span := 1
-	if err := api.SplitFile(inFile, outDir, span, nil); err != nil {
+	if err := api.SplitFile(t.Context(), inFile, outDir, span, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
+// TestSplitSpan2 verifies split span2.
 func TestSplitSpan2(t *testing.T) {
 	msg := "TestSplitSpan2"
 	fileName := "Acroforms2.pdf"
@@ -42,30 +45,48 @@ func TestSplitSpan2(t *testing.T) {
 
 	// Create dual page files of inFile in outDir.
 	span := 2
-	if err := api.SplitFile(inFile, outDir, span, nil); err != nil {
+	if err := api.SplitFile(t.Context(), inFile, outDir, span, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
-func TestSplit0ByBookmark(t *testing.T) {
-	msg := "TestSplit0ByBookmark"
+// TestSplitByBookmark verifies split by bookmark.
+func TestSplitByBookmark(t *testing.T) {
+	msg := "TestSplitByBookmark"
 	fileName := "5116.DCT_Filter.pdf"
 	inFile := filepath.Join(inDir, fileName)
 
 	// Split along bookmarks.
 	span := 0
-	if err := api.SplitFile(inFile, outDir, span, nil); err != nil {
+	if err := api.SplitFile(t.Context(), inFile, outDir, span, nil); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
+// TestSplitByPageNr verifies split by page nr.
+func TestSplitByPageNr(t *testing.T) {
+	msg := "TestSplitByPageNr"
+	fileName := "5116.DCT_Filter.pdf"
+	inFile := filepath.Join(inDir, fileName)
+
+	// Generate page section 1
+	// Generate page section 2-9
+	// Generate page section 10-49
+	// Generate page section 50-last page
+
+	if err := api.SplitByPageNrFile(t.Context(), inFile, outDir, []int{2, 10, 50}, nil); err != nil {
+		t.Fatalf("%s: %v\n", msg, err)
+	}
+}
+
+// TestSplitLowLevel verifies split low level.
 func TestSplitLowLevel(t *testing.T) {
 	msg := "TestSplitLowLevel"
 	inFile := filepath.Join(inDir, "TheGoProgrammingLanguageCh1.pdf")
 	outFile := filepath.Join(outDir, "MyExtractedPageSpan.pdf")
 
 	// Create a context.
-	ctx, err := api.ReadContextFile(inFile)
+	ctx, err := api.ReadContextFile(t.Context(), inFile)
 	if err != nil {
 		t.Fatalf("%s readContext: %v\n", msg, err)
 	}
@@ -74,7 +95,7 @@ func TestSplitLowLevel(t *testing.T) {
 	from, thru := 2, 4
 	selectedPages := api.PagesForPageRange(from, thru)
 	usePgCache := false
-	ctxNew, err := ctx.ExtractPages(selectedPages, usePgCache)
+	ctxNew, err := pdfcpu.ExtractPages(t.Context(), ctx, selectedPages, usePgCache)
 	if err != nil {
 		t.Fatalf("%s ExtractPages(%d,%d): %v\n", msg, from, thru, err)
 	}
@@ -82,7 +103,7 @@ func TestSplitLowLevel(t *testing.T) {
 	// Here you can process this single page PDF context.
 
 	// Write context to file.
-	if err := api.WriteContextFile(ctxNew, outFile); err != nil {
+	if err := api.WriteContextFile(t.Context(), ctxNew, outFile); err != nil {
 		t.Fatalf("%s write: %v\n", msg, err)
 	}
 }

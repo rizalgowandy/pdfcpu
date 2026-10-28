@@ -17,44 +17,54 @@
 package api
 
 import (
+	"context"
+	"fmt"
 	"io"
-	"os"
-	"time"
 
+	"github.com/pdfcpu/pdfcpu/internal/contextutil"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/fault"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-// Info returns information about rs.
-func Info(rs io.ReadSeeker, selectedPages []string, conf *pdfcpu.Configuration) ([]string, error) {
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
-	} else {
-		// Validation loads infodict.
-		conf.ValidationMode = pdfcpu.ValidationRelaxed
-	}
-	ctx, _, _, err := readAndValidate(rs, conf, time.Now())
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.EnsurePageCount(); err != nil {
-		return nil, err
-	}
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, false)
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.DetectWatermarks(); err != nil {
-		return nil, err
-	}
-	return ctx.InfoDigest(pages)
-}
+// PDFInfo returns information about rs and supports cancellation.
+// PDFInfo always uses relaxed validation.
+func PDFInfo(c context.Context, rs io.ReadSeeker, fileName string, selectedPages []string, fonts bool, conf *model.Configuration) (info *pdfcpu.PDFInfo, err error) {
+	defer fault.Catch(&err)
 
-// InfoFile returns information about inFile.
-func InfoFile(inFile string, selectedPages []string, conf *pdfcpu.Configuration) ([]string, error) {
-	f, err := os.Open(inFile)
-	if err != nil {
+	if err := contextutil.Check(c); err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return Info(f, selectedPages, conf)
+	if rs == nil {
+		return nil, ErrMissingPDFReadSeeker
+	}
+
+	conf = operationConfiguration(conf, model.LISTINFO)
+	conf.ValidationMode = model.ValidationRelaxed
+
+	ctx, err := ReadAndValidate(c, rs, conf)
+	if err != nil {
+		return nil, fmt.Errorf("info: prepare PDF context: %w", err)
+	}
+
+	if fonts {
+		if err = OptimizeContext(c, ctx); err != nil {
+			return nil, fmt.Errorf("info: optimize context: %w", err)
+		}
+	}
+
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, false)
+	if err != nil {
+		return nil, fmt.Errorf("info: parse page selection: %w", err)
+	}
+
+	if err := pdfcpu.DetectWatermarks(c, ctx); err != nil {
+		return nil, fmt.Errorf("info: detect watermarks: %w", err)
+	}
+
+	info, err = pdfcpu.Info(c, ctx, fileName, pages, fonts)
+	if err != nil {
+		return nil, fmt.Errorf("info: collect document info: %w", err)
+	}
+	return info, contextutil.Check(c)
 }

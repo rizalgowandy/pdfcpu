@@ -17,93 +17,128 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
-	"time"
 
-	"github.com/pdfcpu/pdfcpu/pkg/log"
+	"github.com/pdfcpu/pdfcpu/internal/contextutil"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/fault"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-// Trim generates a trimmed version of rs
-// containing all selected pages and writes the result to w.
-func Trim(rs io.ReadSeeker, w io.Writer, selectedPages []string, conf *pdfcpu.Configuration) error {
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
+func selectedPageNumbers(c context.Context, pageCount int, pages map[int]bool) ([]int, error) {
+	pageNrs := make([]int, 0, len(pages))
+	for pageNr := 1; pageNr <= pageCount; pageNr++ {
+		if err := contextutil.Check(c); err != nil {
+			return nil, err
+		}
+		if pages[pageNr] {
+			pageNrs = append(pageNrs, pageNr)
+		}
 	}
-	conf.Cmd = pdfcpu.TRIM
+	return pageNrs, nil
+}
 
-	fromStart := time.Now()
-	ctx, durRead, durVal, durOpt, err := readValidateAndOptimize(rs, conf, fromStart)
+// Trim generates a trimmed version of rs, writes the result to w and supports cancellation.
+func Trim(c context.Context, rs io.ReadSeeker, w io.Writer, selectedPages []string, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+
+	if w == nil {
+		return ErrMissingPDFWriter
+	}
+
+	conf = operationConfiguration(conf, model.TRIM)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
+	if err != nil {
+		return fmt.Errorf("trim: %w", err)
+	}
+
+	pages, err := PagesForSelection(ctx.PageCount, selectedPages, false)
+	if err != nil {
+		return fmt.Errorf("trim: parse page selection: %w", err)
+	}
+
+	pageNrs, err := selectedPageNumbers(c, ctx.PageCount, pages)
 	if err != nil {
 		return err
 	}
-
-	if err := ctx.EnsurePageCount(); err != nil {
-		return err
+	if len(pageNrs) == 0 {
+		return nil
 	}
 
-	fromWrite := time.Now()
-
-	pages, err := PagesForPageSelection(ctx.PageCount, selectedPages, false)
+	ctxDest, err := pdfcpu.ExtractPages(c, ctx, pageNrs, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("trim: extract pages: %w", err)
 	}
 
-	// No special context processing required.
-	// WriteContext decides which pages get written by checking conf.Cmd
-
-	ctx.Write.SelectedPages = pages
-	if err = WriteContext(ctx, w); err != nil {
-		return err
+	if conf.PostProcessValidate {
+		if err = ValidateContext(c, ctxDest); err != nil {
+			return fmt.Errorf("trim: validate output: %w", err)
+		}
 	}
 
-	durWrite := time.Since(fromWrite).Seconds()
-	durTotal := time.Since(fromStart).Seconds()
-	logOperationStats(ctx, "trim, write", durRead, durVal, durOpt, durWrite, durTotal)
-
+	if err = WriteContext(c, ctxDest, w); err != nil {
+		return fmt.Errorf("trim: write output: %w", err)
+	}
 	return nil
 }
 
-// TrimFile generates a trimmed version of inFile
-// containing all selected pages and writes the result to outFile.
-func TrimFile(inFile, outFile string, selectedPages []string, conf *pdfcpu.Configuration) (err error) {
+// TrimFile generates a trimmed version of inFile, writes the result to outFile and supports cancellation.
+func TrimFile(c context.Context, inFile, outFile string, selectedPages []string, conf *model.Configuration) (err error) {
 	var f1, f2 *os.File
+	ok := false
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
 
 	if f1, err = os.Open(inFile); err != nil {
-		return err
+		return fmt.Errorf("trim: open input %s: %w", inFile, err)
 	}
 
-	tmpFile := inFile + ".tmp"
+	tmpFile := ""
 	if outFile != "" && inFile != outFile {
 		tmpFile = outFile
-		log.CLI.Printf("writing %s...\n", outFile)
-	} else {
-		log.CLI.Printf("writing %s...\n", inFile)
 	}
-	if f2, err = os.Create(tmpFile); err != nil {
+	staged, err := openStagedOutput(f1, inFile, tmpFile, "trim")
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("trim: create output: %w", err),
+			closeFile(f1, "trim: close input"),
+		)
+	}
+	f2 = staged.output.file
+
+	defer func() {
+		if !ok {
+			err = staged.cleanup(err)
+			return
+		}
+		err = staged.commit()
+	}()
+
+	if err = Trim(c, f1, f2, selectedPages, conf); err != nil {
+		return err
+	}
+	if err = contextutil.Check(c); err != nil {
 		return err
 	}
 
-	defer func() {
-		if err != nil {
-			f2.Close()
-			f1.Close()
-			os.Remove(tmpFile)
-			return
-		}
-		if err = f2.Close(); err != nil {
-			return
-		}
-		if err = f1.Close(); err != nil {
-			return
-		}
-		if outFile == "" || inFile == outFile {
-			if err = os.Rename(tmpFile, inFile); err != nil {
-				return
-			}
-		}
-	}()
+	ok = true
 
-	return Trim(f1, f2, selectedPages, conf)
+	return nil
 }

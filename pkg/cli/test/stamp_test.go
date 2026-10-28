@@ -22,39 +22,42 @@ import (
 
 	"github.com/pdfcpu/pdfcpu/pkg/cli"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
 func testAddWatermarks(t *testing.T, msg, inFile, outFile string, selectedPages []string, mode, modeParm, desc string, onTop bool) {
 	t.Helper()
 	inFile = filepath.Join(inDir, inFile)
 	outFile = filepath.Join(outDir, outFile)
-	unit := pdfcpu.POINTS
+	unit := types.POINTS
 
 	var (
-		wm  *pdfcpu.Watermark
+		wm  *model.Watermark
 		err error
 	)
 	switch mode {
 	case "text":
-		wm, err = pdfcpu.ParseTextWatermarkDetails(modeParm, desc, onTop, unit)
+		wm, err = pdfcpu.ParseTextWatermarkDetails(t.Context(), modeParm, desc, onTop, unit, nil)
 	case "image":
-		wm, err = pdfcpu.ParseImageWatermarkDetails(modeParm, desc, onTop, unit)
+		wm, err = pdfcpu.ParseImageWatermarkDetails(t.Context(), modeParm, desc, onTop, unit, nil)
 	case "pdf":
-		wm, err = pdfcpu.ParsePDFWatermarkDetails(modeParm, desc, onTop, unit)
+		wm, err = pdfcpu.ParsePDFWatermarkDetails(t.Context(), modeParm, desc, onTop, unit, nil)
 	}
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
-	cmd := cli.AddWatermarksCommand(inFile, outFile, selectedPages, wm, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.AddWatermarksCommand(inFile, outFile, selectedPages, wm, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	if err := validateFile(t, outFile, nil); err != nil {
+	if err := validateFile(t, outFile, conf); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }
 
+// TestAddWatermarks verifies add watermarks.
 func TestAddWatermarks(t *testing.T) {
 	for _, tt := range []struct {
 		msg             string
@@ -95,7 +98,7 @@ func TestAddWatermarks(t *testing.T) {
 			true,
 			"text",
 			"Demo",
-			"font:Courier, c: 1 0 0, op:1, sc:1 abs, points:48"},
+			"font:Courier, c: 1 0 0, op:1, scale:1 abs, points:48"},
 
 		// Add image watermark to inFile starting at page 1 using no rotation.
 		{"TestWatermarkImage",
@@ -114,7 +117,7 @@ func TestAddWatermarks(t *testing.T) {
 			true,
 			"image",
 			filepath.Join(resDir, "pdfchip3.png"),
-			"sc:.5 a, rot:-90"},
+			"scale:.5 a, rot:-90"},
 
 		// Add a PDF stamp to all pages of inFile using the 3rd page of pdfFile
 		// and rotate along the 2nd diagonal running from upper left to lower right corner.
@@ -142,59 +145,67 @@ func TestAddWatermarks(t *testing.T) {
 	}
 }
 
-func TestStampingLifecyle(t *testing.T) {
-	msg := "TestStampingLifecyle"
+// TestStampingLifecycle verifies stamping lifecycle.
+func TestStampingLifecycle(t *testing.T) {
+	msg := "TestStampingLifecycle"
 	inFile := filepath.Join(inDir, "Acroforms2.pdf")
 	outFile := filepath.Join(outDir, "stampLC.pdf")
 	onTop := true // we are testing stamps
-	unit := pdfcpu.POINTS
+	unit := types.POINTS
 
 	// Stamp all pages.
-	wm, err := pdfcpu.ParseTextWatermarkDetails("Demo", "", onTop, unit)
+	wm, err := pdfcpu.ParseTextWatermarkDetails(t.Context(), "Demo", "", onTop, unit, nil)
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	cmd := cli.AddWatermarksCommand(inFile, outFile, nil, wm, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd := cli.AddWatermarksCommand(inFile, outFile, nil, wm, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// // Update stamp on page 1.
-	wm, err = pdfcpu.ParseTextWatermarkDetails("Confidential", "", onTop, unit)
+	wm, err = pdfcpu.ParseTextWatermarkDetails(t.Context(), "Confidential", "", onTop, unit, nil)
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 	wm.Update = true
-	cmd = cli.AddWatermarksCommand(outFile, "", []string{"1"}, wm, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.AddWatermarksCommand(outFile, "", []string{"1"}, wm, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Add another stamp on top for all pages.
 	// This is a redish transparent footer.
-	wm, err = pdfcpu.ParseTextWatermarkDetails("Footer", "pos:bc, c:0.8 0 0, op:.6, rot:0", onTop, unit)
+	wm, err = pdfcpu.ParseTextWatermarkDetails(
+		t.Context(),
+		"Footer",
+		"pos:bc, c:0.8 0 0, op:.6, rot:0",
+		onTop,
+		unit,
+		nil,
+	)
 	if err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
-	cmd = cli.AddWatermarksCommand(outFile, "", nil, wm, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.AddWatermarksCommand(outFile, "", nil, wm, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Remove stamp on page 1.
-	cmd = cli.RemoveWatermarksCommand(outFile, "", []string{"1"}, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.RemoveWatermarksCommand(outFile, "", []string{"1"}, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Remove all stamps.
-	cmd = cli.RemoveWatermarksCommand(outFile, "", nil, nil)
-	if _, err := cli.Process(cmd); err != nil {
+	cmd = cli.RemoveWatermarksCommand(outFile, "", nil, conf)
+	if _, err := cli.Dispatch(t.Context(), cmd); err != nil {
 		t.Fatalf("%s %s: %v\n", msg, outFile, err)
 	}
 
 	// Validate the result.
-	if err := validateFile(t, outFile, nil); err != nil {
+	if err := validateFile(t, outFile, conf); err != nil {
 		t.Fatalf("%s: %v\n", msg, err)
 	}
 }

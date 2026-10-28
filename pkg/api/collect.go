@@ -17,88 +17,105 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
-	"time"
 
-	"github.com/pdfcpu/pdfcpu/pkg/log"
+	"github.com/pdfcpu/pdfcpu/internal/contextutil"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/fault"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-// Collect creates a custom PDF page sequence for selected pages of rs and writes the result to w.
-func Collect(rs io.ReadSeeker, w io.Writer, selectedPages []string, conf *pdfcpu.Configuration) error {
-	if conf == nil {
-		conf = pdfcpu.NewDefaultConfiguration()
-	}
-	conf.Cmd = pdfcpu.COLLECT
+// Collect creates a custom PDF page sequence for selected pages of rs, writes it to w and supports cancellation.
+func Collect(c context.Context, rs io.ReadSeeker, w io.Writer, selectedPages []string, conf *model.Configuration) (err error) {
+	defer fault.Catch(&err)
 
-	fromStart := time.Now()
-	ctx, _, _, _, err := readValidateAndOptimize(rs, conf, fromStart)
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if rs == nil {
+		return ErrMissingPDFReadSeeker
+	}
+
+	if w == nil {
+		return ErrMissingPDFWriter
+	}
+
+	conf = operationConfiguration(conf, model.COLLECT)
+
+	ctx, err := ReadValidateAndOptimize(c, rs, conf, nil)
 	if err != nil {
-		return err
-	}
-
-	if err := ctx.EnsurePageCount(); err != nil {
-		return err
+		return fmt.Errorf("collect: %w", err)
 	}
 
 	pages, err := PagesForPageCollection(ctx.PageCount, selectedPages)
 	if err != nil {
+		return fmt.Errorf("collect: parse page selection: %w", err)
+	}
+
+	if err := contextutil.Check(c); err != nil {
 		return err
 	}
 
-	ctxDest, err := ctx.ExtractPages(pages, true)
+	ctxDest, err := pdfcpu.ExtractPages(c, ctx, pages, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("collect: extract pages: %w", err)
 	}
 
-	if conf.ValidationMode != pdfcpu.ValidationNone {
-		if err = ValidateContext(ctxDest); err != nil {
-			return err
-		}
+	if err = Write(c, ctxDest, w, conf); err != nil {
+		return fmt.Errorf("collect: write output: %w", err)
 	}
-
-	return WriteContext(ctxDest, w)
+	return nil
 }
 
-// CollectFile creates a custom PDF page sequence for inFile and writes the result to outFile.
-func CollectFile(inFile, outFile string, selectedPages []string, conf *pdfcpu.Configuration) (err error) {
+// CollectFile creates a custom PDF page sequence for inFile, writes the result to outFile and supports cancellation.
+func CollectFile(c context.Context, inFile, outFile string, selectedPages []string, conf *model.Configuration) (err error) {
 	var f1, f2 *os.File
+	ok := false
+
+	if err := contextutil.Check(c); err != nil {
+		return err
+	}
+	if inFile == "" {
+		return ErrMissingPDFInput
+	}
 
 	if f1, err = os.Open(inFile); err != nil {
-		return err
+		return fmt.Errorf("collect: open input %s: %w", inFile, err)
 	}
 
-	tmpFile := inFile + ".tmp"
+	tmpFile := ""
 	if outFile != "" && inFile != outFile {
 		tmpFile = outFile
-		log.CLI.Printf("writing %s...\n", outFile)
-	} else {
-		log.CLI.Printf("writing %s...\n", inFile)
 	}
-	if f2, err = os.Create(tmpFile); err != nil {
+	staged, err := openStagedOutput(f1, inFile, tmpFile, "collect")
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("collect: create output: %w", err),
+			closeFile(f1, "collect: close input"),
+		)
+	}
+	f2 = staged.output.file
+
+	defer func() {
+		if !ok {
+			err = staged.cleanup(err)
+			return
+		}
+		err = staged.commit()
+	}()
+
+	if err = Collect(c, f1, f2, selectedPages, conf); err != nil {
+		return err
+	}
+	if err = contextutil.Check(c); err != nil {
 		return err
 	}
 
-	defer func() {
-		if err != nil {
-			f2.Close()
-			f1.Close()
-			os.Remove(tmpFile)
-			return
-		}
-		if err = f2.Close(); err != nil {
-			return
-		}
-		if err = f1.Close(); err != nil {
-			return
-		}
-		if outFile == "" || inFile == outFile {
-			if err = os.Rename(tmpFile, inFile); err != nil {
-				return
-			}
-		}
-	}()
+	ok = true
 
-	return Collect(f1, f2, selectedPages, conf)
+	return nil
 }

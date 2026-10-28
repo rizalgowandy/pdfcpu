@@ -19,10 +19,8 @@ package filter
 import (
 	"bytes"
 	"encoding/ascii85"
+	"errors"
 	"io"
-	"io/ioutil"
-
-	"github.com/pkg/errors"
 )
 
 type ascii85Decode struct {
@@ -34,50 +32,44 @@ const eodASCII85 = "~>"
 // Encode implements encoding for an ASCII85Decode filter.
 func (f ascii85Decode) Encode(r io.Reader) (io.Reader, error) {
 
-	p, err := ioutil.ReadAll(r)
-	if err != nil {
+	b2 := &bytes.Buffer{}
+	encoder := ascii85.NewEncoder(b2)
+	if _, err := io.Copy(encoder, r); err != nil {
 		return nil, err
 	}
-
-	buf := &bytes.Buffer{}
-	encoder := ascii85.NewEncoder(buf)
-	encoder.Write(p)
 	encoder.Close()
 
 	// Add eod sequence
-	buf.WriteString(eodASCII85)
+	b2.WriteString(eodASCII85)
 
-	return buf, nil
+	return b2, nil
 }
 
 // Decode implements decoding for an ASCII85Decode filter.
 func (f ascii85Decode) Decode(r io.Reader) (io.Reader, error) {
+	return f.DecodeLength(r, -1)
+}
 
-	p, err := ioutil.ReadAll(r)
+// DecodeLength implements decoding for an ASCII85Decode filter with a maximum output length.
+func (f ascii85Decode) DecodeLength(r io.Reader, maxLen int64) (io.Reader, error) {
+	bb, err := getReaderBytes(r)
 	if err != nil {
 		return nil, err
 	}
 
-	// fmt.Printf("dump:\n%s", hex.Dump(p))
-
-	l := len(p)
-	if p[l-1] == 0x0A || p[l-1] == 0x0D {
-		p = p[:l-1]
+	i := bytes.Index(bb, []byte(eodASCII85))
+	if i < 0 {
+		return nil, errors.New("ASCII85 decode: missing eod marker")
 	}
 
-	if !bytes.HasSuffix(p, []byte(eodASCII85)) {
-		return nil, errors.New("pdfcpu: Decode: missing eod marker")
-	}
+	bb = bb[:i]
 
-	// Strip eod sequence: "~>"
-	p = p[:len(p)-2]
+	decoder := ascii85.NewDecoder(bytes.NewReader(bb))
 
-	decoder := ascii85.NewDecoder(bytes.NewReader(p))
-
-	buf, err := ioutil.ReadAll(decoder)
+	b2, err := f.copyDecoded(decoder, maxLen)
 	if err != nil {
 		return nil, err
 	}
 
-	return bytes.NewBuffer(buf), nil
+	return b2, nil
 }
